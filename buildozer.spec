@@ -17,5 +17,6 @@ android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = develop
 p4a.local_recipes = ./p4a-recipes
+p4a.hook = ./p4a-hook.py
 [buildozer]
 log_level = 2
