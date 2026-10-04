@@ -83,6 +83,10 @@ def detect_ball_hsv(frame_bgr, last_pos=None):
     Tune V thresholds for your hall lighting. Works best with dark background.
     ~3-5 ms on a phone CPU at 640px wide (no GPU needed).
     """
+    if frame_bgr is None:
+        return None
+    if frame_bgr.ndim == 2:
+        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
     h, w = frame_bgr.shape[:2]
     scale = 640.0 / max(w, 1)
     small = cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))

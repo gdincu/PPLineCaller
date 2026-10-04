@@ -8,6 +8,7 @@ Flow:
 Desktop test: `python app/main.py` (uses webcam). APK: build via GitHub Action.
 """
 import cv2
+import numpy as np
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.graphics.texture import Texture
@@ -15,8 +16,11 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.image import Image
+from kivy.utils import platform
 
 from serve_caller import TableMapper, ServeCaller, detect_ball_hsv
+
+IS_ANDROID = platform == "android"
 
 try:
     from plyer import tts  # Android TTS; no-op on desktop if missing
@@ -30,7 +34,10 @@ class ServeApp(App):
         self.caller = ServeCaller(self.table)
         self.calib_pts = []
         self.calibrating = False
-        self.cap = cv2.VideoCapture(0)
+        # Android: capture via Kivy's camera provider (pyjnius -> Camera API),
+        # because cv2.VideoCapture has no working backend in the p4a opencv build.
+        self.cam = None
+        self.cap = None if IS_ANDROID else cv2.VideoCapture(0)
         self.last_ball = None
 
         root = BoxLayout(orientation="vertical")
@@ -81,6 +88,54 @@ class ServeApp(App):
         self.caller.reset()
         self.status.text = "Watching serve..."
 
+    def on_start(self):
+        if not IS_ANDROID:
+            return
+        try:
+            from android.permissions import request_permissions, Permission
+            request_permissions([Permission.CAMERA], self._camera_granted)
+        except Exception:
+            self._init_camera()
+
+    def _camera_granted(self, permissions, grant_results):
+        if grant_results and grant_results[0]:
+            self._init_camera()
+        else:
+            self.status.text = "Camera permission denied"
+
+    def _init_camera(self):
+        if self.cam is not None:
+            return
+        try:
+            from kivy.core.camera import Camera as CoreCamera
+            self.cam = CoreCamera(index=0, resolution=(1280, 720))
+            self.cam.start()
+        except Exception as e:
+            self.status.text = f"Camera error: {e}"
+
+    def _read_frame(self):
+        if IS_ANDROID:
+            if self.cam is None:
+                return None
+            try:
+                buf = self.cam.grab_frame()
+            except Exception:
+                return None
+            if buf is None:
+                return None
+            try:
+                # NV21 -> BGR, same conversion Kivy's read_frame() does
+                # (np.fromstring was removed in numpy 2.x, hence manual).
+                w, h = self.cam.resolution
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape((h + h // 2, w))
+                return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
+            except Exception:
+                return None
+        if self.cap is None or not self.cap.isOpened():
+            return None
+        ok, frame = self.cap.read()
+        return frame if ok else None
+
     def say(self, text):
         if tts is not None:
             try:
@@ -89,8 +144,8 @@ class ServeApp(App):
                 pass
 
     def tick(self, _dt):
-        ok, frame = self.cap.read()
-        if not ok:
+        frame = self._read_frame()
+        if frame is None:
             return
         self.frame = frame
         if self.table.H is not None and not self.calibrating:
