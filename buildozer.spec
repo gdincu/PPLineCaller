@@ -9,9 +9,11 @@ requirements = python3,kivy,numpy,opencv,plyer
 orientation = landscape
 fullscreen = 0
 android.permissions = CAMERA,INTERNET
-android.api = 33
+android.api = 34
 android.minapi = 24
+android.build_tools = 34.0.0
 android.ndk = 25b
+android.accept_sdk_license = True
 p4a.branch = master
 [buildozer]
 log_level = 2
