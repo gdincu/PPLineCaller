@@ -8,9 +8,12 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
-      - run: pip install buildozer cython
-      - run: yes | buildozer android debug
+      - run: pip install "cython==0.29.36" buildozer
+      - run: buildozer android debug 2>&1 | tee buildozer.log
         env:
           ACCEPT_SDK_LICENSE: "yes"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: buildozer-log, path: buildozer.log}
       - uses: actions/upload-artifact@v4
         with: {name: apk, path: bin/*.apk}
