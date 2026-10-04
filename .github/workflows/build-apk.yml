@@ -9,11 +9,18 @@ jobs:
         with: {python-version: '3.11'}
       - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
       - run: pip install "cython==0.29.36" buildozer
-      - run: buildozer android debug 2>&1 | tee buildozer.log
+      - run: |
+          set -o pipefail
+          buildozer android debug 2>&1 | tee buildozer.log
         env:
           ACCEPT_SDK_LICENSE: "yes"
+      - run: |
+          echo "=== bin ==="; ls -lhR bin 2>&1 || true
+          echo "=== find apk/aab ==="; find . -maxdepth 5 -name "*.apk" -o -name "*.aab" | xargs ls -lh 2>&1 || true
+        if: always()
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: buildozer-log, path: buildozer.log}
+        with: {name: buildozer-log, path: buildozer.log, if-no-files-found: warn}
       - uses: actions/upload-artifact@v4
-        with: {name: apk, path: bin/*.apk}
+        if: always()
+        with: {name: apk, path: bin/, if-no-files-found: warn}
