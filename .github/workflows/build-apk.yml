@@ -7,7 +7,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf libtool pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+      - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
       - run: pip install "cython==0.29.36" buildozer
       - run: |
           set -o pipefail
