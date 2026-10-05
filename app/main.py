@@ -62,6 +62,11 @@ class ServeApp(App):
         self.last_ball = None
         self._tex = None
         self._said = False
+        # DIAGNOSTIC (temporary): switches the preview between the flipped
+        # and unflipped frame. One of them matches how Kivy displays the
+        # texture on your device; taps are exact only in the matching
+        # position. If FLIP Y fixes tapping, keep it on and recalibrate.
+        self.flip_y = False
 
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
@@ -87,6 +92,9 @@ class ServeApp(App):
         bar.add_widget(b_cal)
         bar.add_widget(b_go)
         bar.add_widget(b_rst)
+        b_flip = Button(text="FLIP Y")
+        b_flip.bind(on_press=self.toggle_flip)
+        bar.add_widget(b_flip)
 
         root.add_widget(self.view)
         root.add_widget(self.status)
@@ -98,6 +106,15 @@ class ServeApp(App):
     # -- config ---------------------------------------------------------
     def _current_mode(self):
         return ROLE_OPTIONS.get(self.role_spinner.text, "server")
+
+    def toggle_flip(self, *_):
+        # DIAGNOSTIC (temporary): show the frame the other way up, then
+        # re-tap CALIBRATE corners (old points belong to the other view).
+        self.flip_y = not self.flip_y
+        self.calib_pts = []
+        self.calibrating = True
+        self.status.text = (f"View flipped ({'ON' if self.flip_y else 'OFF'}). "
+                            f"Tap 1/4: {CALIB_STEPS[0]}")
 
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
@@ -126,19 +143,25 @@ class ServeApp(App):
                                 f"({len(self.calib_pts)}/4: {CALIB_STEPS[len(self.calib_pts)]})")
             return True
         u = (lx - x0) / tw   # 0 = left edge of frame
-        v = (ly - y0) / th   # 1 = top edge of frame (preview is right-side-up)
+        v = (ly - y0) / th   # 1 = top edge of displayed image
         x = u * w
-        y = (1.0 - v) * h
+        y = (1.0 - v) * h    # frame row 0 is the top of the camera image
         self.calib_pts.append((x, y))
         n = len(self.calib_pts)
+        # DIAGNOSTIC (temporary): report raw/local/rect/pixel so a tap
+        # offset can be diagnosed from a screenshot (also in logcat).
+        diag = (f"win=({touch.x:.0f},{touch.y:.0f}) "
+                f"loc=({lx:.0f},{ly:.0f}) view={img.width:.0f}x{img.height:.0f} "
+                f"img={tw:.0f}x{th:.0f} px=({x:.0f},{y:.0f})")
+        Logger.info(f"PPLineCaller: tap{n}/4 {diag} flip_y={self.flip_y}")
         if n < 4:
-            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
+            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]} | {diag}"
         else:
             srv_r, srv_l, recv_l, recv_r = self.calib_pts
             self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
             self.caller = ServeCaller(self.table, mode=self._current_mode())
             self.calibrating = False
-            self.status.text = "Calibrated. Tap START SERVE."
+            self.status.text = f"Calibrated. Tap START SERVE. | {diag}"
         return True
 
     def start_serve(self, *_):
@@ -266,8 +289,10 @@ class ServeApp(App):
                     self.status.text = (f"Watching [{self.caller.mode}]... "
                                         f"bounces={len(self.caller.bounces)}")
         # Upload as RGB: GLES has no BGR texture format, and reuse one texture
-        # instead of allocating a new one every frame.
-        buf = cv2.cvtColor(cv2.flip(frame, 0), cv2.COLOR_BGR2RGB).tobytes()
+        # instead of allocating a new one every frame. flip_y shows the
+        # frame the other way up (diagnostic: match Kivy's texture display).
+        disp = frame if self.flip_y else cv2.flip(frame, 0)
+        buf = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB).tobytes()
         size = (frame.shape[1], frame.shape[0])
         if self._tex is None or self._tex.size != size:
             self._tex = Texture.create(size=size, colorfmt="rgb")
