@@ -128,9 +128,14 @@ class ServeApp(App):
         if not img.collide_point(touch.x, touch.y):
             return False
         h, w = self.frame.shape[:2]
-        # touch is in window coords; convert to widget-local (origin
-        # bottom-left of the Image widget, which sits above the buttons).
-        lx, ly = img.to_widget(touch.x, touch.y)
+        # touch is in window coords; the Image widget sits above the status
+        # label + buttons, so subtract its position to get widget-local
+        # coords (origin bottom-left of the widget). NOTE: do NOT use
+        # img.to_widget() here: with the default relative=False it returns
+        # the point unchanged for plain widgets (no subtraction), which put
+        # every marker one widget-height too high.
+        lx = touch.x - img.x
+        ly = touch.y - img.y
         # The frame is letterboxed inside the widget (keep_ratio); only the
         # centred norm_image_size rect shows the camera image.
         tw, th = img.norm_image_size
