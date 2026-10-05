@@ -4,13 +4,11 @@ Android-only: built as an APK via the GitHub Action (buildozer). There is
 no desktop/webcam path.
 
 Flow:
-  1. Fix the phone (tripod): either behind the server (end view, elevated,
-     centred) or on the side of the table by your half.
-  2. Pick phone position + what this phone watches:
-       END + FULL            -> one phone judges B1 (server-right) + B2 (receiver-right)
-       SIDE server half      -> this phone judges B1 in server-right only
-       SIDE receiver half    -> this phone judges B2 in receiver-right only
-     (Two side phones together cover the diagonal serve, one quarter each.)
+  1. Fix the phone on the side of the table by your half (tripod,
+     landscape), framing the whole table.
+  2. Pick this phone's side (one phone per side, one quarter each):
+       SIDE: server half (B1)   -> judges bounce 1 in server-right only
+       SIDE: receiver half (B2) -> judges bounce 2 in receiver-right only
   3. Tap CALIBRATE then tap the 4 table corners IN ORDER:
        1. SERVER-RIGHT (near end, server's right)
        2. SERVER-LEFT  (near end, server's left)
@@ -46,24 +44,16 @@ CALIB_STEPS = (
 # Short tags drawn next to each tapped point on the preview.
 CALIB_SHORT = ("1 SR", "2 SL", "3 RL", "4 RR")
 
-POSITION_OPTIONS = (
-    "END: behind server",
-    "SIDE: server half",
-    "SIDE: receiver half",
-)
-
-WATCH_OPTIONS = {
-    "FULL (B1+B2)": "full",
-    "SERVER-RIGHT only (B1)": "server",
-    "RECEIVER-RIGHT only (B2)": "receiver",
+ROLE_OPTIONS = {
+    "SIDE: server half (B1)": "server",
+    "SIDE: receiver half (B2)": "receiver",
 }
-WATCH_LABELS = {v: k for k, v in WATCH_OPTIONS.items()}
 
 
 class ServeApp(App):
     def build(self):
         self.table = TableMapper()
-        self.caller = ServeCaller(self.table, mode="full")
+        self.caller = ServeCaller(self.table, mode="server")
         self.calib_pts = []
         self.calibrating = False
         # Android capture via Kivy's camera provider (pyjnius -> Camera API),
@@ -74,18 +64,18 @@ class ServeApp(App):
         self._said = False
 
         root = BoxLayout(orientation="vertical")
-        self.view = Image()
+        # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
+        # so the preview is as large as possible; taps are mapped through
+        # the displayed rect (norm_image_size) in on_tap.
+        self.view = Image(allow_stretch=True, keep_ratio=True)
         self.view.bind(on_touch_down=self.on_tap)
-        self.status = Label(text="Pick position, tap CALIBRATE, then 4 corners in order",
+        self.status = Label(text="Pick side, tap CALIBRATE, then 4 corners in order",
                             size_hint_y=0.12)
 
         cfg = BoxLayout(size_hint_y=0.12)
-        self.pos_spinner = Spinner(text=POSITION_OPTIONS[0], values=POSITION_OPTIONS)
-        self.pos_spinner.bind(text=self.on_position)
-        self.watch_spinner = Spinner(text=WATCH_LABELS["full"],
-                                     values=tuple(WATCH_OPTIONS.keys()))
-        cfg.add_widget(self.pos_spinner)
-        cfg.add_widget(self.watch_spinner)
+        self.role_spinner = Spinner(text="SIDE: server half (B1)",
+                                    values=tuple(ROLE_OPTIONS.keys()))
+        cfg.add_widget(self.role_spinner)
 
         bar = BoxLayout(size_hint_y=0.12)
         b_cal = Button(text="CALIBRATE")
@@ -107,16 +97,7 @@ class ServeApp(App):
 
     # -- config ---------------------------------------------------------
     def _current_mode(self):
-        return WATCH_OPTIONS.get(self.watch_spinner.text, "full")
-
-    def on_position(self, _spinner, text):
-        # Suggest the matching watch role; user can still override it.
-        if text == POSITION_OPTIONS[1]:
-            self.watch_spinner.text = WATCH_LABELS["server"]
-        elif text == POSITION_OPTIONS[2]:
-            self.watch_spinner.text = WATCH_LABELS["receiver"]
-        else:
-            self.watch_spinner.text = WATCH_LABELS["full"]
+        return ROLE_OPTIONS.get(self.role_spinner.text, "server")
 
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
@@ -127,10 +108,27 @@ class ServeApp(App):
     def on_tap(self, img, touch):
         if not self.calibrating or getattr(self, "frame", None) is None:
             return False
+        if not img.collide_point(touch.x, touch.y):
+            return False
         h, w = self.frame.shape[:2]
-        # Image widget stretches frame; map touch -> pixel
-        x = touch.x / img.width * w
-        y = (1.0 - touch.y / img.height) * h
+        # touch is in window coords; convert to widget-local (origin
+        # bottom-left of the Image widget, which sits above the buttons).
+        lx, ly = img.to_widget(touch.x, touch.y)
+        # The frame is letterboxed inside the widget (keep_ratio); only the
+        # centred norm_image_size rect shows the camera image.
+        tw, th = img.norm_image_size
+        if tw <= 0 or th <= 0:
+            return False
+        x0 = (img.width - tw) / 2.0
+        y0 = (img.height - th) / 2.0
+        if not (x0 <= lx <= x0 + tw and y0 <= ly <= y0 + th):
+            self.status.text = (f"Tap inside the camera view "
+                                f"({len(self.calib_pts)}/4: {CALIB_STEPS[len(self.calib_pts)]})")
+            return True
+        u = (lx - x0) / tw   # 0 = left edge of frame
+        v = (ly - y0) / th   # 1 = top edge of frame (preview is right-side-up)
+        x = u * w
+        y = (1.0 - v) * h
         self.calib_pts.append((x, y))
         n = len(self.calib_pts)
         if n < 4:

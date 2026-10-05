@@ -11,8 +11,8 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 ## Features
 
 * **Android-only, CPU-Only Performance:** Optimized using classic computer vision (HSV thresholding, circularity filtering, and frame deltas). No heavy GPU requirements, PyTorch, or cloud AI (Roboflow) needed.
-* **4-Point Calibration in fixed table order:** Tap the 4 corners as 1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right (left/right from the server's perspective). Works from behind the server, the opposite end, or the side of the table.
-* **End or side phone position:** One phone behind the server judges the whole serve, or two phones on the side (one per half) each judge a single quarter.
+* **4-Point Calibration in fixed table order:** Tap the 4 corners as 1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right (left/right from the server's perspective). Each tap is drawn numbered on the preview.
+* **Side phone position, one quarter each:** Two phones on the side (one per half) each judge a single quarter — `SIDE: server half (B1)` or `SIDE: receiver half (B2)` via one combined setting.
 * **Bounce & Trajectory Analysis:** Tracks vertical velocity inversions ($\Delta y_1 > 0 \rightarrow \Delta y_2 < 0$) to accurately locate bounce points on the table.
 * **ITTF Doubles Rule Verification:** Validates that doubles serve bounce 1 occurs in the Server's Right half and bounce 2 lands diagonally in the Receiver's Right half (ITTF 2.6.3). Centre line counts as IN.
 
@@ -22,20 +22,7 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 
 ### 1. Camera Setup
 
-Option A - one phone, end view: tripod **behind the server**, elevated and centred on the center line, landscape. Mode: `FULL (B1+B2)`.
-
-```text
-       [ RECEIVER SIDE ]
-  +------------+------------+  (Top-Left Quadrant = Receiver Right)
-  |            |            |
-  +============+============+  <-- NET
-  |            |            |
-  +------------+------------+  (Bottom-Right Quadrant = Server Right)
-       [ SERVER SIDE ]
-             📷 (Camera Position, END)
-```
-
-Option B - two phones, side view: one phone on the side by the server half watching `SERVER-RIGHT only (B1)`, one phone on the side by the receiver half watching `RECEIVER-RIGHT only (B2)`. Each phone still frames the whole table (wide enough to see faults) but only calls its own quarter. Landscape orientation.
+Two phones on the side of the table, landscape, each framing the whole table (wide enough to see faults) but only calling its own quarter. Pick one setting per phone: `SIDE: server half (B1)` or `SIDE: receiver half (B2)`.
 
 ```text
        [ RECEIVER SIDE ]
@@ -50,7 +37,7 @@ Option B - two phones, side view: one phone on the side by the server half watch
 
 ### 2. Homography & Court Mapping (`TableMapper`)
 
-Tapping the four corners in table order maps camera pixel space to a fixed 2D top-down grid regardless of viewpoint (end or side):
+Tapping the four corners in table order maps camera pixel space to a fixed 2D top-down grid:
 * **Net Line:** $y = H / 2$
 * **Center Line:** $x = W / 2$
 * **Server Right Quadrant:** Bottom-Right
@@ -60,17 +47,16 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * Color masks evaluate white and orange balls using HSV color ranges alongside spatial continuity checks.
 * Sequential trajectory points stored in a `deque` evaluate vertical velocity flips ($\Delta y_1 > 0$ then $\Delta y_2 < 0$) to detect frame-accurate bounce events.
 
-### 4. Serve Adjudication (`ServeCaller`)
-* **FULL mode:** Bounce 1 must land in `server_right`, bounce 2 in `receiver_right`, else **FAULT**; both pass $\rightarrow$ **IN**.
-* **SERVER mode:** judges the first bounce only (must be `server_right`). Use on the server-half side phone.
-* **RECEIVER mode:** ignores server-side bounces (bounce 1 belongs to the other phone) and judges the first receiver-side bounce (must be `receiver_right`). Use on the receiver-half side phone.
+### 4. Serve Adjudication (`ServeCaller`, one combined side setting)
+* **SIDE: server half (B1):** judges the first bounce only (must be `server_right`). Use on the server-half side phone.
+* **SIDE: receiver half (B2):** ignores server-side bounces (bounce 1 belongs to the other phone) and judges the first receiver-side bounce (must be `receiver_right`). Use on the receiver-half side phone.
 * Bounces outside the calibrated table (`off_table`) count as **FAULT** for the phone responsible for that half.
 
 ---
 
 ## Build the APK
 
-Push to GitHub; the `build-apk` workflow builds with buildozer/python-for-android and uploads the APK artifact. Install on the phone(s), pick position + watch mode per phone, calibrate (4 taps in order), then START SERVE.
+Push to GitHub; the `build-apk` workflow builds with buildozer/python-for-android and uploads the APK artifact. Install on both phones, pick the side per phone, calibrate (4 taps in order), then START SERVE.
 
 ---
 

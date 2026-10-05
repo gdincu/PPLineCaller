@@ -6,9 +6,9 @@ Doubles serve rule (ITTF 2.6.3, simplified):
 
 Android-only: runs as an APK (Kivy + OpenCV). No desktop/webcam path.
 
-Camera assumption: phone on tripod either behind the server (end view,
-elevated, centred) or on the side of the table. Calibration taps are given
-in fixed table-centric order so any viewpoint works:
+Camera assumption: phone on tripod on the side of the table by your half,
+framing the whole table (wide enough to see faults). Calibration taps are
+given in fixed table-centric order so the side viewpoint works:
   1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right
 (left/right as seen by the server facing the net - a fixed reference).
 We warp the table to a top-down rectangle with a 4-point homography.
@@ -19,12 +19,12 @@ After warp:
   - receiver-right (diagonal, receiver's own right) = top-left quadrant
     (server-centric left, far end)
 
-Device modes (see ServeCaller):
-  - "full": one phone behind the server sees the whole table, judges B1+B2.
-  - "server": phone on the side by the server half, judges bounce 1 only.
+Device modes (see ServeCaller, one phone per side):
+  - "server": phone on the side by the server half, judges bounce 1 only
+    (must be server-right).
   - "receiver": phone on the side by the receiver half, ignores the
-    server-side bounce and judges the first receiver-side bounce only.
-    Use one phone per side so each phone only has to call its own quarter.
+    server-side bounce and judges the first receiver-side bounce only
+    (must be receiver-right).
 """
 from collections import deque
 import cv2
@@ -50,8 +50,8 @@ class TableMapper:
 
     Preferred: set_corners_table_order() with taps in fixed table-centric
     order (server-right, server-left, receiver-left, receiver-right,
-    left/right from the server's perspective). Works from behind the
-    server, from the opposite end, or from the side of the table.
+    left/right from the server's perspective). Works from the side of the
+    table (or either end).
     Legacy: set_corners() auto-orders 4 unordered taps; only reliable for
     the behind-server end view.
     """
@@ -186,23 +186,19 @@ def is_bounce(traj, min_drop=3.0, min_rise=3.0):
 class ServeCaller:
     """State machine: IDLE -> SERVE_LIVE -> DECIDED. Call reset() per serve.
 
-    Modes:
-      "full":     single phone sees the whole table; judges bounce 1 in
-                 server_right then bounce 2 in receiver_right.
+    Modes (one phone per side, side of the table):
       "server":   side phone by the server half; judges the FIRST bounce
                  only (must be server_right). Ignores everything after.
       "receiver": side phone by the receiver half; ignores server-side
                  bounces (bounce 1) and judges the first receiver-side
-                 bounce (must be receiver_right). Use with a second phone
-                 in "server" mode so each phone only calls its own quarter.
-    Off-table bounces (outside the calibrated quad) are FAULT in
-    "full"/"server" modes, and FAULT in "receiver" mode once the bounce
-    is on the receiver side.
+                 bounce (must be receiver_right).
+    Off-table bounces (outside the calibrated quad) are FAULT for the
+    phone responsible for that half.
     """
 
-    MODES = ("full", "server", "receiver")
+    MODES = ("server", "receiver")
 
-    def __init__(self, table: TableMapper, behind_server=True, mode="full"):
+    def __init__(self, table: TableMapper, behind_server=True, mode="server"):
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
         self.table = table
@@ -247,13 +243,11 @@ class ServeCaller:
         return self.verdict
 
     def _judge(self):
-        if self.mode == "server":
-            self._judge_single("server_right")
-        elif self.mode == "receiver":
+        if self.mode == "receiver":
             # only receiver-side bounces reach here (server side ignored above)
             self._judge_single("receiver_right")
         else:
-            self._judge_full()
+            self._judge_single("server_right")
 
     def _judge_single(self, want):
         q = self.bounces[-1][2]
@@ -263,18 +257,3 @@ class ServeCaller:
         else:
             self.verdict, self.state = "FAULT", "DECIDED"
             self.reason = f"bounce in {q}, need {want}"
-
-    def _judge_full(self):
-        if len(self.bounces) == 1:
-            q = self.bounces[0][2]
-            if q != "server_right":
-                self.verdict, self.state = "FAULT", "DECIDED"
-                self.reason = f"1st bounce in {q}, need server_right"
-        elif len(self.bounces) >= 2:
-            q1, q2 = self.bounces[0][2], self.bounces[1][2]
-            if q1 == "server_right" and q2 == "receiver_right":
-                self.verdict, self.state = "IN", "DECIDED"
-                self.reason = "server_right -> receiver_right, diagonal OK"
-            else:
-                self.verdict, self.state = "FAULT", "DECIDED"
-                self.reason = f"bounces {q1} -> {q2}, need server_right -> receiver_right"
