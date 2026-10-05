@@ -1,11 +1,24 @@
 """Kivy APK entry: ping-pong doubles serve line-caller. CPU-only (OpenCV + numpy).
 
-Flow:
-  1. Point phone at table (tripod behind server, elevated, centred).
-  2. Tap CALIBRATE then tap the 4 table corners in the preview (TL,TR,BR,BL any order).
-  3. Tap START SERVE, serve, app speaks/shows IN or FAULT.
+Android-only: built as an APK via the GitHub Action (buildozer). There is
+no desktop/webcam path.
 
-Desktop test: `python app/main.py` (uses webcam). APK: build via GitHub Action.
+Flow:
+  1. Fix the phone (tripod): either behind the server (end view, elevated,
+     centred) or on the side of the table by your half.
+  2. Pick phone position + what this phone watches:
+       END + FULL            -> one phone judges B1 (server-right) + B2 (receiver-right)
+       SIDE server half      -> this phone judges B1 in server-right only
+       SIDE receiver half    -> this phone judges B2 in receiver-right only
+     (Two side phones together cover the diagonal serve, one quarter each.)
+  3. Tap CALIBRATE then tap the 4 table corners IN ORDER:
+       1. SERVER-RIGHT (near end, server's right)
+       2. SERVER-LEFT  (near end, server's left)
+       3. RECEIVER-LEFT (far end, same long edge as 2)
+       4. RECEIVER-RIGHT (far end, same long edge as 1)
+     Left/right are fixed from the server's perspective facing the net, so
+     the order works from the end or the side, either end of the table.
+  4. Tap START SERVE, serve, app speaks/shows IN or FAULT.
 """
 import cv2
 import numpy as np
@@ -17,35 +30,63 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.image import Image
-from kivy.utils import platform
+from kivy.uix.spinner import Spinner
 
 from serve_caller import TableMapper, ServeCaller, detect_ball_hsv
 
-IS_ANDROID = platform == "android"
+from plyer import tts
 
-try:
-    from plyer import tts  # Android TTS; no-op on desktop if missing
-except Exception:
-    tts = None
+# Ordered calibration prompts (table-centric, server perspective).
+CALIB_STEPS = (
+    "SERVER-RIGHT (near end, server's right)",
+    "SERVER-LEFT (near end, server's left)",
+    "RECEIVER-LEFT (far end, same edge as SERVER-LEFT)",
+    "RECEIVER-RIGHT (far end, same edge as SERVER-RIGHT)",
+)
+# Short tags drawn next to each tapped point on the preview.
+CALIB_SHORT = ("1 SR", "2 SL", "3 RL", "4 RR")
+
+POSITION_OPTIONS = (
+    "END: behind server",
+    "SIDE: server half",
+    "SIDE: receiver half",
+)
+
+WATCH_OPTIONS = {
+    "FULL (B1+B2)": "full",
+    "SERVER-RIGHT only (B1)": "server",
+    "RECEIVER-RIGHT only (B2)": "receiver",
+}
+WATCH_LABELS = {v: k for k, v in WATCH_OPTIONS.items()}
 
 
 class ServeApp(App):
     def build(self):
         self.table = TableMapper()
-        self.caller = ServeCaller(self.table)
+        self.caller = ServeCaller(self.table, mode="full")
         self.calib_pts = []
         self.calibrating = False
-        # Android: capture via Kivy's camera provider (pyjnius -> Camera API),
+        # Android capture via Kivy's camera provider (pyjnius -> Camera API),
         # because cv2.VideoCapture has no working backend in the p4a opencv build.
         self.cam = None
-        self.cap = None if IS_ANDROID else cv2.VideoCapture(0)
         self.last_ball = None
         self._tex = None
+        self._said = False
 
         root = BoxLayout(orientation="vertical")
         self.view = Image()
         self.view.bind(on_touch_down=self.on_tap)
-        self.status = Label(text="Tap CALIBRATE, then tap 4 table corners", size_hint_y=0.12)
+        self.status = Label(text="Pick position, tap CALIBRATE, then 4 corners in order",
+                            size_hint_y=0.12)
+
+        cfg = BoxLayout(size_hint_y=0.12)
+        self.pos_spinner = Spinner(text=POSITION_OPTIONS[0], values=POSITION_OPTIONS)
+        self.pos_spinner.bind(text=self.on_position)
+        self.watch_spinner = Spinner(text=WATCH_LABELS["full"],
+                                     values=tuple(WATCH_OPTIONS.keys()))
+        cfg.add_widget(self.pos_spinner)
+        cfg.add_widget(self.watch_spinner)
+
         bar = BoxLayout(size_hint_y=0.12)
         b_cal = Button(text="CALIBRATE")
         b_cal.bind(on_press=self.start_calib)
@@ -56,16 +97,32 @@ class ServeApp(App):
         bar.add_widget(b_cal)
         bar.add_widget(b_go)
         bar.add_widget(b_rst)
+
         root.add_widget(self.view)
         root.add_widget(self.status)
+        root.add_widget(cfg)
         root.add_widget(bar)
         Clock.schedule_interval(self.tick, 1.0 / 30.0)
         return root
 
+    # -- config ---------------------------------------------------------
+    def _current_mode(self):
+        return WATCH_OPTIONS.get(self.watch_spinner.text, "full")
+
+    def on_position(self, _spinner, text):
+        # Suggest the matching watch role; user can still override it.
+        if text == POSITION_OPTIONS[1]:
+            self.watch_spinner.text = WATCH_LABELS["server"]
+        elif text == POSITION_OPTIONS[2]:
+            self.watch_spinner.text = WATCH_LABELS["receiver"]
+        else:
+            self.watch_spinner.text = WATCH_LABELS["full"]
+
+    # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
         self.calib_pts = []
         self.calibrating = True
-        self.status.text = f"Tapping corners: {len(self.calib_pts)}/4"
+        self.status.text = f"Tap 1/4: {CALIB_STEPS[0]}"
 
     def on_tap(self, img, touch):
         if not self.calibrating or getattr(self, "frame", None) is None:
@@ -75,24 +132,28 @@ class ServeApp(App):
         x = touch.x / img.width * w
         y = (1.0 - touch.y / img.height) * h
         self.calib_pts.append((x, y))
-        self.status.text = f"Tapping corners: {len(self.calib_pts)}/4"
-        if len(self.calib_pts) == 4:
-            self.table.set_corners(self.calib_pts)
-            self.caller = ServeCaller(self.table)
+        n = len(self.calib_pts)
+        if n < 4:
+            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
+        else:
+            srv_r, srv_l, recv_l, recv_r = self.calib_pts
+            self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
+            self.caller = ServeCaller(self.table, mode=self._current_mode())
             self.calibrating = False
             self.status.text = "Calibrated. Tap START SERVE."
         return True
 
     def start_serve(self, *_):
         if self.table.H is None:
-            self.status.text = "Calibrate first (4 corners)."
+            self.status.text = "Calibrate first (4 corners in order)."
             return
+        self.caller = ServeCaller(self.table, mode=self._current_mode())
         self.caller.reset()
-        self.status.text = "Watching serve..."
+        self._said = False
+        self.status.text = f"Watching serve [{self.caller.mode}]..."
 
+    # -- android camera -------------------------------------------------
     def on_start(self):
-        if not IS_ANDROID:
-            return
         try:
             from android.permissions import request_permissions, Permission
             request_permissions([Permission.CAMERA], self._camera_granted)
@@ -130,51 +191,60 @@ class ServeApp(App):
         return self._actual_size
 
     def _read_frame(self):
-        if IS_ANDROID:
-            if self.cam is None:
-                return None
-            try:
-                buf = self.cam.grab_frame()
-            except Exception:
-                return None
-            if buf is None:
-                return None
-            try:
-                # NV21 -> BGR, same conversion Kivy's read_frame() does
-                # (np.fromstring was removed in numpy 2.x, hence manual).
-                w, h = self._preview_size()
-                n = w * (h + h // 2)
-                arr = np.frombuffer(buf, dtype=np.uint8)[:n].reshape((h + h // 2, w))
-                frame = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
-                if not getattr(self, "_frame_logged", False):
-                    self._frame_logged = True
-                    Logger.info(f"PPLineCaller: buf={len(buf)} preview={w}x{h} "
-                                f"Y mean={arr[:h].mean():.1f} BGR mean={frame.mean():.1f}")
-                return frame
-            except Exception as e:
-                if not getattr(self, "_decode_err_logged", False):
-                    self._decode_err_logged = True
-                    Logger.exception(f"PPLineCaller: frame decode failed: {e}")
-                    self.status.text = f"Frame decode error: {e}"
-                return None
-        if self.cap is None or not self.cap.isOpened():
+        if self.cam is None:
             return None
-        ok, frame = self.cap.read()
-        return frame if ok else None
+        try:
+            buf = self.cam.grab_frame()
+        except Exception:
+            return None
+        if buf is None:
+            return None
+        try:
+            # NV21 -> BGR, same conversion Kivy's read_frame() does
+            # (np.fromstring was removed in numpy 2.x, hence manual).
+            w, h = self._preview_size()
+            n = w * (h + h // 2)
+            arr = np.frombuffer(buf, dtype=np.uint8)[:n].reshape((h + h // 2, w))
+            frame = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
+            if not getattr(self, "_frame_logged", False):
+                self._frame_logged = True
+                Logger.info(f"PPLineCaller: buf={len(buf)} preview={w}x{h} "
+                            f"Y mean={arr[:h].mean():.1f} BGR mean={frame.mean():.1f}")
+            return frame
+        except Exception as e:
+            if not getattr(self, "_decode_err_logged", False):
+                self._decode_err_logged = True
+                Logger.exception(f"PPLineCaller: frame decode failed: {e}")
+                self.status.text = f"Frame decode error: {e}"
+            return None
 
     def say(self, text):
-        if tts is not None:
-            try:
-                tts.speak(text)
-            except Exception:
-                pass
+        try:
+            tts.speak(text)
+        except Exception:
+            pass
+
+    def _draw_calib_points(self, frame):
+        """Draw each tapped corner (numbered) plus joining lines."""
+        import numpy as np
+        pts = [(int(x), int(y)) for x, y in self.calib_pts]
+        if len(pts) >= 2:
+            cv2.polylines(frame, [np.array(pts, dtype=np.int32)], False,
+                          (0, 255, 255), 2)
+        for i, (px, py) in enumerate(pts):
+            cv2.circle(frame, (px, py), 12, (0, 255, 255), -1)
+            cv2.circle(frame, (px, py), 12, (0, 0, 0), 2)
+            cv2.putText(frame, CALIB_SHORT[i], (px + 16, py - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
     def tick(self, _dt):
         frame = self._read_frame()
         if frame is None:
             return
         self.frame = frame
-        if self.table.H is not None and not self.calibrating:
+        if self.calibrating:
+            self._draw_calib_points(frame)
+        elif self.table.H is not None:
             det = detect_ball_hsv(frame, self.last_ball)
             self.last_ball = (det[0], det[1]) if det else None
             verdict = self.caller.update(self.last_ball)
@@ -188,14 +258,15 @@ class ServeApp(App):
                 cv2.putText(frame, f"B{i+1}:{q}", (int(bx) + 10, int(by)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
             if verdict:
-                self.status.text = f"{verdict}: {self.caller.reason}"
-                if not getattr(self, "_said", False):
+                self.status.text = f"[{self.caller.mode}] {verdict}: {self.caller.reason}"
+                if not self._said:
                     self.say("In" if verdict == "IN" else "Fault")
                     self._said = True
             else:
                 self._said = False
                 if self.caller.state == "SERVE_LIVE":
-                    self.status.text = f"Watching... bounces={len(self.caller.bounces)}"
+                    self.status.text = (f"Watching [{self.caller.mode}]... "
+                                        f"bounces={len(self.caller.bounces)}")
         # Upload as RGB: GLES has no BGR texture format, and reuse one texture
         # instead of allocating a new one every frame.
         buf = cv2.cvtColor(cv2.flip(frame, 0), cv2.COLOR_BGR2RGB).tobytes()
