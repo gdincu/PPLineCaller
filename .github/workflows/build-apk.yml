@@ -7,8 +7,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
-      - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev patchelf
+      - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
       - run: pip install "cython==0.29.36" buildozer
+      - run: |
+          set -o pipefail
+          # Pre-install p4a (buildozer.spec points p4a.source_dir at this
+          # checkout) with link flags so every compiled lib is 16 KB-aligned.
+          mkdir -p .buildozer/android/platform
+          git clone -b develop --single-branch --depth 1 \
+            https://github.com/kivy/python-for-android.git \
+            .buildozer/android/platform/python-for-android
+          sed -i "s|^    common_ldflags = \['-L{ctx_libs_dir}'\]|    common_ldflags = ['-L{ctx_libs_dir}', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']|" \
+            .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
+          grep -n "max-page-size" .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
+          printf 'APP_LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384\n' >> \
+            .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
+          tail -n 3 .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
       - run: |
           set -o pipefail
           buildozer android debug 2>&1 | tee buildozer.log
