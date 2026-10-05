@@ -30,7 +30,8 @@ from kivy.uix.label import Label
 from kivy.uix.image import Image
 from kivy.uix.spinner import Spinner
 
-from serve_caller import TableMapper, ServeCaller, detect_ball_hsv
+from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
+                            BallTracker, small_gray)
 
 from plyer import tts
 
@@ -59,14 +60,10 @@ class ServeApp(App):
         # Android capture via Kivy's camera provider (pyjnius -> Camera API),
         # because cv2.VideoCapture has no working backend in the p4a opencv build.
         self.cam = None
-        self.last_ball = None
+        self.tracker = BallTracker()
+        self._prev_small = None
         self._tex = None
         self._said = False
-        # DIAGNOSTIC (temporary): switches the preview between the flipped
-        # and unflipped frame. One of them matches how Kivy displays the
-        # texture on your device; taps are exact only in the matching
-        # position. If FLIP Y fixes tapping, keep it on and recalibrate.
-        self.flip_y = False
 
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
@@ -92,9 +89,6 @@ class ServeApp(App):
         bar.add_widget(b_cal)
         bar.add_widget(b_go)
         bar.add_widget(b_rst)
-        b_flip = Button(text="FLIP Y")
-        b_flip.bind(on_press=self.toggle_flip)
-        bar.add_widget(b_flip)
 
         root.add_widget(self.view)
         root.add_widget(self.status)
@@ -106,15 +100,6 @@ class ServeApp(App):
     # -- config ---------------------------------------------------------
     def _current_mode(self):
         return ROLE_OPTIONS.get(self.role_spinner.text, "server")
-
-    def toggle_flip(self, *_):
-        # DIAGNOSTIC (temporary): show the frame the other way up, then
-        # re-tap CALIBRATE corners (old points belong to the other view).
-        self.flip_y = not self.flip_y
-        self.calib_pts = []
-        self.calibrating = True
-        self.status.text = (f"View flipped ({'ON' if self.flip_y else 'OFF'}). "
-                            f"Tap 1/4: {CALIB_STEPS[0]}")
 
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
@@ -153,20 +138,14 @@ class ServeApp(App):
         y = (1.0 - v) * h    # frame row 0 is the top of the camera image
         self.calib_pts.append((x, y))
         n = len(self.calib_pts)
-        # DIAGNOSTIC (temporary): report raw/local/rect/pixel so a tap
-        # offset can be diagnosed from a screenshot (also in logcat).
-        diag = (f"win=({touch.x:.0f},{touch.y:.0f}) "
-                f"loc=({lx:.0f},{ly:.0f}) view={img.width:.0f}x{img.height:.0f} "
-                f"img={tw:.0f}x{th:.0f} px=({x:.0f},{y:.0f})")
-        Logger.info(f"PPLineCaller: tap{n}/4 {diag} flip_y={self.flip_y}")
         if n < 4:
-            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]} | {diag}"
+            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
         else:
             srv_r, srv_l, recv_l, recv_r = self.calib_pts
             self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
             self.caller = ServeCaller(self.table, mode=self._current_mode())
             self.calibrating = False
-            self.status.text = f"Calibrated. Tap START SERVE. | {diag}"
+            self.status.text = "Calibrated. Tap START SERVE."
         return True
 
     def start_serve(self, *_):
@@ -175,6 +154,7 @@ class ServeApp(App):
             return
         self.caller = ServeCaller(self.table, mode=self._current_mode())
         self.caller.reset()
+        self.tracker.reset()
         self._said = False
         self.status.text = f"Watching serve [{self.caller.mode}]..."
 
@@ -271,11 +251,15 @@ class ServeApp(App):
         if self.calibrating:
             self._draw_calib_points(frame)
         elif self.table.H is not None:
-            det = detect_ball_hsv(frame, self.last_ball)
-            self.last_ball = (det[0], det[1]) if det else None
-            verdict = self.caller.update(self.last_ball)
-            if det:
-                x, y, r = (int(det[0]), int(det[1]), int(det[2]))
+            det = detect_ball_hsv(frame, self.tracker.pos,
+                                  table_poly=self.table.corners,
+                                  prev_small=self._prev_small)
+            self._prev_small, _ = small_gray(frame)
+            pos = self.tracker.update(det)
+            verdict = self.caller.update(pos)
+            if pos is not None:
+                x, y = (int(pos[0]), int(pos[1]))
+                r = int(det[2]) if det else 4
                 cv2.circle(frame, (x, y), max(r, 4), (0, 0, 255), 2)
             # draw table outline + bounces
             cv2.polylines(frame, [self.table.corners.astype(int)], True, (0, 255, 0), 2)
@@ -294,10 +278,8 @@ class ServeApp(App):
                     self.status.text = (f"Watching [{self.caller.mode}]... "
                                         f"bounces={len(self.caller.bounces)}")
         # Upload as RGB: GLES has no BGR texture format, and reuse one texture
-        # instead of allocating a new one every frame. flip_y shows the
-        # frame the other way up (diagnostic: match Kivy's texture display).
-        disp = frame if self.flip_y else cv2.flip(frame, 0)
-        buf = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB).tobytes()
+        # instead of allocating a new one every frame.
+        buf = cv2.cvtColor(cv2.flip(frame, 0), cv2.COLOR_BGR2RGB).tobytes()
         size = (frame.shape[1], frame.shape[0])
         if self._tex is None or self._tex.size != size:
             self._tex = Texture.create(size=size, colorfmt="rgb")

@@ -43,8 +43,10 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * **Server Right Quadrant:** Bottom-Right
 * **Receiver Right Quadrant:** Top-Left (Diagonal)
 
-### 3. Ball Tracking & Bounce Detection (`detect_ball_hsv` & `is_bounce`)
+### 3. Ball Tracking & Bounce Detection (`detect_ball_hsv`, `BallTracker` & `is_bounce`)
 * Color masks evaluate white and orange balls using HSV color ranges alongside spatial continuity checks.
+* False positives are cut with three cheap gates: a **table-ROI mask** from the calibrated corners (kills crowd/lights/walls off the table), **inter-frame motion** (static white blobs like logos and tape are rejected), and stricter **shape** checks (circularity, hull solidity, circle fill-ratio, vertex count).
+* A confirmed-track gate (`BallTracker`) only feeds the serve logic once a blob persists near its predicted position, so single-frame lookalikes can't inject phantom bounces.
 * Sequential trajectory points stored in a `deque` evaluate vertical velocity flips ($\Delta y_1 > 0$ then $\Delta y_2 < 0$) to detect frame-accurate bounce events.
 
 ### 4. Serve Adjudication (`ServeCaller`, one combined side setting)

@@ -124,19 +124,45 @@ class TableMapper:
         return "server" if ty > WARP_H / 2 else "receiver"
 
 
-def detect_ball_hsv(frame_bgr, last_pos=None):
+def _resize_small(frame_bgr, width=640):
+    h, w = frame_bgr.shape[:2]
+    scale = width / max(w, 1)
+    return cv2.resize(frame_bgr, (max(int(w * scale), 1), max(int(h * scale), 1))), scale
+
+
+def small_gray(frame_bgr, width=640):
+    """Downscaled grayscale frame for inter-frame motion gating."""
+    small, scale = _resize_small(frame_bgr, width)
+    if small.ndim == 3:
+        small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    return small, scale
+
+
+def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
+                    min_area=40.0, max_area=1200.0, min_circ=0.65,
+                    min_solidity=0.85, min_fill=0.70, min_vertices=6,
+                    roi_margin=40):
     """Zero-training white/orange ball detector. Returns (x, y, r) or None.
 
+    Beyond colour, false positives are cut with three cheap gates:
+      table ROI  - table_poly (full-res coords, e.g. calibrated corners)
+                   dilated by roi_margin (640-scale px) so airborne balls
+                   still count; kills crowd/lights/walls off the table.
+      motion     - prev_small (640-scale gray of the previous frame);
+                   ANDs the colour mask with a frame-difference mask, so
+                   static white blobs (logos, tape, lamps) are rejected.
+      shape      - circularity + hull solidity + circle fill-ratio +
+                   polygon vertex count, which together reject squares
+                   (4 vertices), crescents, streaks and blobs.
     Tune V thresholds for your hall lighting. Works best with dark background.
-    ~3-5 ms on a phone CPU at 640px wide (no GPU needed).
+    ~4-6 ms on a phone CPU at 640px wide (no GPU needed).
     """
     if frame_bgr is None:
         return None
     if frame_bgr.ndim == 2:
         frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
-    h, w = frame_bgr.shape[:2]
-    scale = 640.0 / max(w, 1)
-    small = cv2.resize(frame_bgr, (int(w * scale), int(h * scale)))
+    small, scale = _resize_small(frame_bgr)
+    h, w = small.shape[:2]
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
 
     white = cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 60, 255]))
@@ -146,19 +172,44 @@ def detect_ball_hsv(frame_bgr, last_pos=None):
     mask = cv2.medianBlur(mask, 5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
+    if table_poly is not None:
+        roi = np.zeros((h, w), dtype=np.uint8)
+        pts = (np.asarray(table_poly, dtype=np.float32).reshape(-1, 2) * scale).astype(np.int32)
+        if len(pts) >= 3:
+            cv2.fillPoly(roi, [pts], 255)
+            if roi_margin > 0:
+                k = max(int(roi_margin), 1)
+                roi = cv2.dilate(roi, np.ones((k, k), np.uint8))
+            mask = cv2.bitwise_and(mask, roi)
+
+    if prev_small is not None:
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        if prev_small.shape == gray.shape:
+            diff = cv2.absdiff(gray, prev_small)
+            _, mot = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
+            mask = cv2.bitwise_and(mask, mot)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best, best_score = None, 0
     for c in contours:
         area = cv2.contourArea(c)
-        if area < 15 or area > 4000:
+        if area < min_area or area > max_area:
             continue
         peri = cv2.arcLength(c, True)
         if peri < 1:
             continue
         circularity = 4 * np.pi * area / (peri * peri)
-        if circularity < 0.45:
+        if circularity < min_circ:
+            continue
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        if hull_area <= 0 or area / hull_area < min_solidity:
             continue
         (cx, cy), r = cv2.minEnclosingCircle(c)
+        if r <= 0 or area / (np.pi * r * r) < min_fill:
+            continue
+        if len(cv2.approxPolyDP(c, 0.02 * peri, True)) < min_vertices:
+            continue
         # prefer round + reasonably sized + near last position (continuity)
         score = circularity * 1000.0 / (1.0 + abs(r - 9.0))
         if last_pos is not None:
@@ -181,6 +232,61 @@ def is_bounce(traj, min_drop=3.0, min_rise=3.0):
     dy1 = traj[-2][1] - traj[-3][1]
     dy2 = traj[-1][1] - traj[-2][1]
     return dy1 > min_drop and dy2 < -min_rise
+
+
+class BallTracker:
+    """Confirmed-track gate between raw detections and serve logic.
+
+    A raw per-frame detection becomes the accepted track position only if
+    it falls within max_jump (full-res px) of the last accepted position; a
+    lost or teleporting track restarts acquisition and needs
+    confirm_streak consecutive gated hits before it feeds the serve logic.
+    The track drops after drop_after_missed frames with no detection. This
+    stops single-frame false positives from injecting phantom points into
+    bounce detection.
+    """
+
+    def __init__(self, max_jump=80.0, confirm_streak=2, drop_after_missed=5):
+        self.max_jump = float(max_jump)
+        self.confirm_streak = int(confirm_streak)
+        self.drop_after_missed = int(drop_after_missed)
+        self.pos = None  # last accepted (x, y) or None
+        self._cand = None
+        self._cand_streak = 0
+        self._missed = 0
+
+    def reset(self):
+        self.pos = None
+        self._cand = None
+        self._cand_streak = 0
+        self._missed = 0
+
+    def update(self, det_or_none):
+        """Feed a raw (x, y[, r]) detection or None. Returns accepted (x, y) or None."""
+        if det_or_none is None:
+            self._missed += 1
+            if self._missed > self.drop_after_missed:
+                self.reset()
+            return None
+        self._missed = 0
+        x, y = float(det_or_none[0]), float(det_or_none[1])
+        if self.pos is not None:
+            if np.hypot(x - self.pos[0], y - self.pos[1]) <= self.max_jump:
+                self.pos = (x, y)
+                return self.pos
+            self.pos = None  # teleport: restart acquisition below
+        if (self._cand is not None
+                and np.hypot(x - self._cand[0], y - self._cand[1]) <= self.max_jump):
+            self._cand_streak += 1
+        else:
+            self._cand = (x, y)
+            self._cand_streak = 1
+        if self._cand_streak >= self.confirm_streak:
+            self.pos = (x, y)
+            self._cand = None
+            self._cand_streak = 0
+            return self.pos
+        return None
 
 
 class ServeCaller:
