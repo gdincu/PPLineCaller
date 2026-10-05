@@ -10,7 +10,7 @@ Desktop test: `python app/main.py` (uses webcam). APK: build via GitHub Action.
 import cv2
 import numpy as np
 from kivy.app import App
-from kivy.clock import Clock
+from kivy.clock import Clock, mainthread
 from kivy.graphics.texture import Texture
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -66,7 +66,7 @@ class ServeApp(App):
         self.status.text = f"Tapping corners: {len(self.calib_pts)}/4"
 
     def on_tap(self, img, touch):
-        if not self.calibrating:
+        if not self.calibrating or getattr(self, "frame", None) is None:
             return False
         h, w = self.frame.shape[:2]
         # Image widget stretches frame; map touch -> pixel
@@ -97,6 +97,9 @@ class ServeApp(App):
         except Exception:
             self._init_camera()
 
+    # The permission callback runs on the Android UI thread; the camera
+    # provider creates a GL texture, which must happen on Kivy's main thread.
+    @mainthread
     def _camera_granted(self, permissions, grant_results):
         if grant_results and grant_results[0]:
             self._init_camera()
