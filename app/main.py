@@ -12,6 +12,7 @@ import numpy as np
 from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.graphics.texture import Texture
+from kivy.logger import Logger
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
@@ -39,6 +40,7 @@ class ServeApp(App):
         self.cam = None
         self.cap = None if IS_ANDROID else cv2.VideoCapture(0)
         self.last_ball = None
+        self._tex = None
 
         root = BoxLayout(orientation="vertical")
         self.view = Image()
@@ -116,6 +118,17 @@ class ServeApp(App):
         except Exception as e:
             self.status.text = f"Camera error: {e}"
 
+    def _preview_size(self):
+        # The device may not honour the requested resolution; use the preview
+        # size the camera actually delivers so the NV21 buffer is decoded right.
+        if getattr(self, "_actual_size", None) is None:
+            try:
+                size = self.cam._android_camera.getParameters().getPreviewSize()
+                self._actual_size = (size.width, size.height)
+            except Exception:
+                self._actual_size = tuple(self.cam.resolution)
+        return self._actual_size
+
     def _read_frame(self):
         if IS_ANDROID:
             if self.cam is None:
@@ -129,10 +142,20 @@ class ServeApp(App):
             try:
                 # NV21 -> BGR, same conversion Kivy's read_frame() does
                 # (np.fromstring was removed in numpy 2.x, hence manual).
-                w, h = self.cam.resolution
-                arr = np.frombuffer(buf, dtype=np.uint8).reshape((h + h // 2, w))
-                return cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
-            except Exception:
+                w, h = self._preview_size()
+                n = w * (h + h // 2)
+                arr = np.frombuffer(buf, dtype=np.uint8)[:n].reshape((h + h // 2, w))
+                frame = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
+                if not getattr(self, "_frame_logged", False):
+                    self._frame_logged = True
+                    Logger.info(f"PPLineCaller: buf={len(buf)} preview={w}x{h} "
+                                f"Y mean={arr[:h].mean():.1f} BGR mean={frame.mean():.1f}")
+                return frame
+            except Exception as e:
+                if not getattr(self, "_decode_err_logged", False):
+                    self._decode_err_logged = True
+                    Logger.exception(f"PPLineCaller: frame decode failed: {e}")
+                    self.status.text = f"Frame decode error: {e}"
                 return None
         if self.cap is None or not self.cap.isOpened():
             return None
@@ -173,10 +196,15 @@ class ServeApp(App):
                 self._said = False
                 if self.caller.state == "SERVE_LIVE":
                     self.status.text = f"Watching... bounces={len(self.caller.bounces)}"
-        buf = cv2.flip(frame, 0).tobytes()
-        tex = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt="bgr")
-        tex.blit_buffer(buf, colorfmt="bgr", bufferfmt="ubyte")
-        self.view.texture = tex
+        # Upload as RGB: GLES has no BGR texture format, and reuse one texture
+        # instead of allocating a new one every frame.
+        buf = cv2.cvtColor(cv2.flip(frame, 0), cv2.COLOR_BGR2RGB).tobytes()
+        size = (frame.shape[1], frame.shape[0])
+        if self._tex is None or self._tex.size != size:
+            self._tex = Texture.create(size=size, colorfmt="rgb")
+        self._tex.blit_buffer(buf, colorfmt="rgb", bufferfmt="ubyte")
+        self.view.texture = self._tex
+        self.view.canvas.ask_update()
 
 
 if __name__ == "__main__":
