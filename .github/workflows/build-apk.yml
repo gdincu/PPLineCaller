@@ -25,6 +25,19 @@ jobs:
           tail -n 3 .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
       - run: |
           set -o pipefail
+          # CMake-built recipes (opencv, jpeg, libwebp) ignore p4a's LDFLAGS and
+          # take linker flags from the NDK toolchain files, so pre-install the
+          # NDK where buildozer looks for it and patch those files.
+          ndk_dir="$HOME/.buildozer/android/platform/android-ndk-r25b"
+          mkdir -p "$(dirname "$ndk_dir")"
+          curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+          unzip -q /tmp/ndk.zip -d "$(dirname "$ndk_dir")"
+          rm /tmp/ndk.zip
+          sed -i 's|-Wl,--build-id=sha1|-Wl,--build-id=sha1 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384|' \
+            "$ndk_dir"/build/cmake/*.cmake
+          grep -n "max-page-size" "$ndk_dir"/build/cmake/*.cmake
+      - run: |
+          set -o pipefail
           buildozer android debug 2>&1 | tee buildozer.log
         env:
           ACCEPT_SDK_LICENSE: "yes"

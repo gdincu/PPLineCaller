@@ -5,7 +5,9 @@ resolution in SDL2):
 
 1. Everything p4a compiles (python, sdl2, kivy, numpy, opencv, thorvg, ...)
    is linked with `-Wl,-z,max-page-size=16384` via a patched archs.py and
-   Application.mk in the p4a checkout - see .github/workflows/build-apk.yml.
+   Application.mk in the p4a checkout, and CMake-built recipes (opencv,
+   jpeg, libwebp) via patched NDK toolchain files - see
+   .github/workflows/build-apk.yml.
 
 2. Prebuilt libs shipped by NDK r25b (libc++_shared.so, libomp.so) are not
    16 KB aligned. GitHub runners preinstall a newer NDK (r27+, which ships
