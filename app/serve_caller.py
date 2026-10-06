@@ -141,7 +141,8 @@ def small_gray(frame_bgr, width=640):
 def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
                     min_area=40.0, max_area=1200.0, min_circ=0.65,
                     min_solidity=0.85, min_fill=0.70, min_vertices=6,
-                    roi_margin=40):
+                    roi_margin=40, motion_thresh=25, white_v_min=150,
+                    white_s_max=60):
     """Zero-training white/orange ball detector. Returns (x, y, r) or None.
 
     Beyond colour, false positives are cut with three cheap gates:
@@ -165,7 +166,8 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     h, w = small.shape[:2]
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
 
-    white = cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 60, 255]))
+    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
+                        np.array([180, white_s_max, 255]))
     orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
     orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
     mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
@@ -186,7 +188,7 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         if prev_small.shape == gray.shape:
             diff = cv2.absdiff(gray, prev_small)
-            _, mot = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            _, mot = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
             mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
             mask = cv2.bitwise_and(mask, mot)
 
@@ -304,12 +306,15 @@ class ServeCaller:
 
     MODES = ("server", "receiver")
 
-    def __init__(self, table: TableMapper, behind_server=True, mode="server"):
+    def __init__(self, table: TableMapper, behind_server=True, mode="server",
+                 min_drop=3.0, min_rise=3.0):
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
         self.table = table
         self.behind_server = behind_server  # legacy, unused (orientation is in taps)
         self.mode = mode
+        self.min_drop = float(min_drop)
+        self.min_rise = float(min_rise)
         self.traj = deque(maxlen=12)
         self.bounces = []  # list of (x, y, quadrant)
         self.state = "IDLE"
@@ -329,7 +334,7 @@ class ServeCaller:
             return self.verdict
         if ball_xy_or_none is not None:
             self.traj.append(ball_xy_or_none)
-            if is_bounce(list(self.traj)):
+            if is_bounce(list(self.traj), self.min_drop, self.min_rise):
                 x, y = ball_xy_or_none[0], ball_xy_or_none[1]
                 q = self.table.quadrant(x, y)
                 on_table = self.table.inside_table(x, y)

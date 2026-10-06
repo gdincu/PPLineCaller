@@ -1,8 +1,8 @@
-# Ping-Pong Serve Line Caller (Android-only)
+# Ping-Pong Serve Line Caller
 
 An automated, real-time Ping-Pong doubles serve line-caller. Built using Python, Kivy, OpenCV, and NumPy, this project provides CPU-only, zero-training ball detection and homography-based court mapping to adjudicate doubles serves according to ITTF rules.
 
-Runs only as a native Android app (APK) with real-time Text-to-Speech (TTS) announcements for instant calls (`IN` vs `FAULT`). There is no desktop/webcam build. The APK is built via the GitHub Action (`build-apk`).
+Runs only as a native Android app (APK) with real-time Text-to-Speech (TTS) announcements for instant calls (`IN` vs `FAULT`).
 
 This project is directly inspired by and based on [clssmitty/PBLineCaller](https://github.com/clssmitty/PBLineCaller/), adapting court-mapping and trajectory bounce-detection principles specifically for table tennis doubles serve rules.
 
@@ -53,12 +53,6 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * **SIDE: server half (B1):** judges the first bounce only (must be `server_right`). Use on the server-half side phone.
 * **SIDE: receiver half (B2):** ignores server-side bounces (bounce 1 belongs to the other phone) and judges the first receiver-side bounce (must be `receiver_right`). Use on the receiver-half side phone.
 * Bounces outside the calibrated table (`off_table`) count as **FAULT** for the phone responsible for that half.
-
----
-
-## Build the APK
-
-Push to GitHub; the `build-apk` workflow builds with buildozer/python-for-android and uploads the APK artifact. Install on both phones, pick the side per phone, calibrate (4 taps in order), then START SERVE.
 
 ---
 

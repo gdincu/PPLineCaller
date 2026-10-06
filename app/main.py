@@ -29,6 +29,10 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.image import Image
 from kivy.uix.spinner import Spinner
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.slider import Slider
+from kivy.metrics import dp
 
 from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
                             BallTracker, small_gray)
@@ -50,6 +54,33 @@ ROLE_OPTIONS = {
     "SIDE: receiver half (B2)": "receiver",
 }
 
+# Live-tuning panel (collapsed by default). Defaults equal the hardcoded
+# detector/tracker/bounce settings. Row format:
+# (param key, label, slider min, slider max, step, value format, is-int).
+TUNE_PARAMS = [
+    ("min_area", "Min area", 5, 500, 5, "{:.0f}", True),
+    ("max_area", "Max area", 200, 4000, 50, "{:.0f}", True),
+    ("min_circ", "Circularity >=", 0.30, 0.95, 0.01, "{:.2f}", False),
+    ("min_solidity", "Solidity >=", 0.50, 1.00, 0.01, "{:.2f}", False),
+    ("min_fill", "Fill ratio >=", 0.50, 1.00, 0.01, "{:.2f}", False),
+    ("min_vertices", "Vertices >=", 0, 12, 1, "{:.0f}", True),
+    ("roi_margin", "ROI margin", 0, 120, 5, "{:.0f}", True),
+    ("motion_thresh", "Motion thr", 5, 100, 1, "{:.0f}", True),
+    ("white_v_min", "White V min", 80, 255, 1, "{:.0f}", True),
+    ("white_s_max", "White S max", 0, 150, 1, "{:.0f}", True),
+    ("max_jump", "Track jump", 20, 200, 5, "{:.0f}", False),
+    ("confirm_streak", "Confirm hits", 1, 5, 1, "{:.0f}", True),
+    ("min_drop", "Bounce drop", 1, 15, 0.5, "{:.1f}", False),
+    ("min_rise", "Bounce rise", 1, 15, 0.5, "{:.1f}", False),
+]
+TUNE_DEFAULTS = {
+    "min_area": 40, "max_area": 1200, "min_circ": 0.65,
+    "min_solidity": 0.85, "min_fill": 0.70, "min_vertices": 6,
+    "roi_margin": 40, "motion_thresh": 25, "white_v_min": 150,
+    "white_s_max": 60, "max_jump": 80.0, "confirm_streak": 2,
+    "min_drop": 3.0, "min_rise": 3.0,
+}
+
 
 class ServeApp(App):
     def build(self):
@@ -60,10 +91,16 @@ class ServeApp(App):
         # Android capture via Kivy's camera provider (pyjnius -> Camera API),
         # because cv2.VideoCapture has no working backend in the p4a opencv build.
         self.cam = None
-        self.tracker = BallTracker()
+        self.params = dict(TUNE_DEFAULTS)
+        self.tracker = BallTracker(max_jump=self.params["max_jump"],
+                                   confirm_streak=int(self.params["confirm_streak"]))
         self._prev_small = None
         self._tex = None
         self._said = False
+        self.tuning_open = False
+        self._tune_sliders = {}
+        self._tune_values = {}
+        self._tune_spec = {k: (fmt, is_int) for k, _, _, _, _, fmt, is_int in TUNE_PARAMS}
 
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
@@ -94,12 +131,74 @@ class ServeApp(App):
         root.add_widget(self.status)
         root.add_widget(cfg)
         root.add_widget(bar)
+        tune_bar = BoxLayout(size_hint_y=0.10)
+        self.tune_toggle = Button(text="TUNING +")
+        self.tune_toggle.bind(on_press=self.toggle_tuning)
+        b_defaults = Button(text="RESET DEFAULTS")
+        b_defaults.bind(on_press=self.reset_tuning)
+        tune_bar.add_widget(self.tune_toggle)
+        tune_bar.add_widget(b_defaults)
+        root.add_widget(tune_bar)
+        self.tune_scroll = ScrollView(size_hint_y=None, height=0)
+        self.tune_grid = GridLayout(cols=3, size_hint_y=None,
+                                    spacing=dp(4), padding=dp(4))
+        self.tune_grid.bind(minimum_height=self.tune_grid.setter("height"))
+        for key, label, lo, hi, step, fmt, _is_int in TUNE_PARAMS:
+            name = Label(text=label, size_hint_x=0.45,
+                         size_hint_y=None, height=dp(40),
+                         halign="left", valign="middle")
+            name.bind(size=name.setter("text_size"))
+            slider = Slider(min=lo, max=hi, step=step,
+                            value=self.params[key],
+                            size_hint_x=0.35,
+                            size_hint_y=None, height=dp(40))
+            slider.bind(value=lambda inst, val, k=key: self._on_tune(k, val))
+            val_label = Label(text=fmt.format(self.params[key]),
+                              size_hint_x=0.20,
+                              size_hint_y=None, height=dp(40))
+            self.tune_grid.add_widget(name)
+            self.tune_grid.add_widget(slider)
+            self.tune_grid.add_widget(val_label)
+            self._tune_sliders[key] = slider
+            self._tune_values[key] = val_label
+        self.tune_scroll.add_widget(self.tune_grid)
+        root.add_widget(self.tune_scroll)
         Clock.schedule_interval(self.tick, 1.0 / 30.0)
         return root
 
     # -- config ---------------------------------------------------------
     def _current_mode(self):
         return ROLE_OPTIONS.get(self.role_spinner.text, "server")
+
+    def toggle_tuning(self, *_):
+        self.tuning_open = not self.tuning_open
+        self.tune_toggle.text = "TUNING -" if self.tuning_open else "TUNING +"
+        self.tune_scroll.height = dp(320) if self.tuning_open else 0
+
+    def reset_tuning(self, *_):
+        for key in self._tune_sliders:
+            self._tune_sliders[key].value = TUNE_DEFAULTS[key]
+        # re-apply explicitly (slider callbacks may not fire if a value
+        # is already at its default)
+        self.params = dict(TUNE_DEFAULTS)
+        for key, (fmt, _is_int) in self._tune_spec.items():
+            self._tune_values[key].text = fmt.format(self.params[key])
+        self._apply_live_settings()
+        self.status.text = "Tuning reset to defaults."
+
+    def _on_tune(self, key, value):
+        fmt, is_int = self._tune_spec[key]
+        value = int(round(value)) if is_int else float(value)
+        self.params[key] = value
+        self._tune_values[key].text = fmt.format(value)
+        self._apply_live_settings()
+
+    def _apply_live_settings(self):
+        p = self.params
+        self.tracker.max_jump = float(p["max_jump"])
+        self.tracker.confirm_streak = int(p["confirm_streak"])
+        self.caller.min_drop = float(p["min_drop"])
+        self.caller.min_rise = float(p["min_rise"])
 
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
@@ -143,7 +242,9 @@ class ServeApp(App):
         else:
             srv_r, srv_l, recv_l, recv_r = self.calib_pts
             self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
-            self.caller = ServeCaller(self.table, mode=self._current_mode())
+            self.caller = ServeCaller(self.table, mode=self._current_mode(),
+                                      min_drop=self.params["min_drop"],
+                                      min_rise=self.params["min_rise"])
             self.calibrating = False
             self.status.text = "Calibrated. Tap START SERVE."
         return True
@@ -152,7 +253,9 @@ class ServeApp(App):
         if self.table.H is None:
             self.status.text = "Calibrate first (4 corners in order)."
             return
-        self.caller = ServeCaller(self.table, mode=self._current_mode())
+        self.caller = ServeCaller(self.table, mode=self._current_mode(),
+                                  min_drop=self.params["min_drop"],
+                                  min_rise=self.params["min_rise"])
         self.caller.reset()
         self.tracker.reset()
         self._said = False
@@ -251,9 +354,17 @@ class ServeApp(App):
         if self.calibrating:
             self._draw_calib_points(frame)
         elif self.table.H is not None:
-            det = detect_ball_hsv(frame, self.tracker.pos,
-                                  table_poly=self.table.corners,
-                                  prev_small=self._prev_small)
+            p = self.params
+            det = detect_ball_hsv(
+                frame, self.tracker.pos, table_poly=self.table.corners,
+                prev_small=self._prev_small, min_area=p["min_area"],
+                max_area=p["max_area"], min_circ=p["min_circ"],
+                min_solidity=p["min_solidity"], min_fill=p["min_fill"],
+                min_vertices=int(p["min_vertices"]),
+                roi_margin=int(p["roi_margin"]),
+                motion_thresh=int(p["motion_thresh"]),
+                white_v_min=int(p["white_v_min"]),
+                white_s_max=int(p["white_s_max"]))
             self._prev_small, _ = small_gray(frame)
             pos = self.tracker.update(det)
             verdict = self.caller.update(pos)
