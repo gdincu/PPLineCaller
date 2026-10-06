@@ -11,8 +11,8 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 ## Features
 
 * **Android-only, CPU-Only Performance:** Optimized using classic computer vision (HSV thresholding, circularity filtering, and frame deltas). No heavy GPU requirements, PyTorch, or cloud AI (Roboflow) needed.
-* **4-Point Calibration in fixed table order:** Tap the 4 corners as 1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right (left/right from the server's perspective). Each tap is drawn numbered on the preview. Full-table mapping is kept (best homography conditioning) even though each phone only judges one quarter.
-* **One phone per quarter, no mode setting:** Place each phone on the long edge bordering its quarter (phones end up diagonal to each other). At START SERVE the app auto-picks the nearest quarter (largest on screen); tap the preview while idle to claim a different quarter. The picked quarter is drawn thick with a `MY:` tag.
+* **4-Point Calibration, positional taps:** Stand at your end on your right-hand edge and tap 1. near-right, 2. near-left, 3. far-left, 4. far-right (same order on both phones). Full-table mapping is kept (best homography conditioning) even though each phone only judges its own quarter.
+* **One phone per quarter, nothing to configure:** Because both phones tap positionally, each phone's own quarter always lands on the same warp slot — no mode or quarter setting exists. Your quarter is drawn thick with a `MY` tag.
 * **Bounce & Trajectory Analysis:** Tracks vertical velocity inversions ($\Delta y_1 > 0 \rightarrow \Delta y_2 < 0$) to accurately locate bounce points on the table.
 * **ITTF Doubles Rule Verification:** Validates that doubles serve bounce 1 occurs in the Server's Right half and bounce 2 lands diagonally in the Receiver's Right half (ITTF 2.6.3). Centre line counts as IN.
 
@@ -22,7 +22,7 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 
 ### 1. Camera Setup
 
-One phone per judged quarter, landscape, on a tripod on the long edge bordering that quarter, each framing the whole table. The two phones end up diagonal to each other (server-right quarter + receiver-right quarter are diagonal).
+One phone per judged quarter, landscape, on a tripod at your end of the table on your right-hand edge, each framing the whole table. The two phones end up diagonal to each other (each judges its own near-right quarter).
 
 ```text
         [ RECEIVER SIDE ]
@@ -32,17 +32,20 @@ One phone per judged quarter, landscape, on a tripod on the long edge bordering 
   |      .     |     .      |
   +------------+------------+
         [ SERVER SIDE ]
-  📷 judges server-right   📷 judges receiver-right
-  (near end, right edge)   (far end, opposite edge)
+  📷 server phone          📷 receiver phone
+  (own end, own           (own end, own
+   right edge)             right edge)
 ```
+
+Both phones tap the corners in the same positional order (near-right, near-left, far-left, far-right from their own end), so each phone's quarter lands on the tap-1 warp slot.
 
 ### 2. Homography & Court Mapping (`TableMapper`)
 
-Tapping the four corners in table order maps camera pixel space to a fixed 2D top-down grid:
+Tapping the four corners maps camera pixel space to a fixed 2D top-down grid:
 * **Net Line:** $y = H / 2$
 * **Center Line:** $x = W / 2$
-* **Server Right Quadrant:** Bottom-Right
-* **Receiver Right Quadrant:** Top-Left (Diagonal)
+* **My Quarter (tap-1, near-right):** Bottom-Right
+* Naming note: quadrant names in code (`server_right`, ...) are slot-based — `server_right` always means the tap-1 quadrant, i.e. MY quarter on every phone.
 
 ### 3. Ball Tracking & Bounce Detection (`detect_ball_hsv`, `BallTracker` & `is_bounce`)
 * Color masks evaluate white and orange balls using HSV color ranges alongside spatial continuity checks.
@@ -50,8 +53,8 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * A confirmed-track gate (`BallTracker`) only feeds the serve logic once a blob persists near its predicted position, so single-frame lookalikes can't inject phantom bounces.
 * Sequential trajectory points stored in a `deque` evaluate vertical velocity flips ($\Delta y_1 > 0$ then $\Delta y_2 < 0$) to detect frame-accurate bounce events.
 
-### 4. Serve Adjudication (`ServeCaller`, single quarter, no modes)
-* At START SERVE the app auto-picks the nearest quarter (largest image area); tap the preview while idle to claim a different one. The pick is shown as `MY QUARTER: <name> (auto|tap)` and drawn thick on the preview.
+### 4. Serve Adjudication (`ServeCaller`, fixed quarter, no selection)
+* There is nothing to configure: positional taps put MY quarter on the tap-1 warp slot on every phone, and it is drawn thick with a `MY` tag.
 * The first bounce seen is judged: inside my quarter (+line pad, centre/net lines count IN) → **IN**, anything else (wrong half or `off_table`) → **FAULT**. Cross-half bounces never enter the quarter-cropped track, so no ignore-other-half logic is needed.
 * Known gap: a fault landing far outside your crop produces no verdict on your phone (nothing to track) — the other phone or the players call those.
 

@@ -6,27 +6,26 @@ Doubles serve rule (ITTF 2.6.3, simplified):
 
 Android-only: runs as an APK (Kivy + OpenCV). No desktop/webcam path.
 
-Camera assumption: one phone per judged quarter, on a tripod on the
-long edge bordering that quarter (phones end up diagonal to each other),
-landscape, framing the whole table. Calibration taps are given in fixed
-table-centric order so the side viewpoint works:
-  1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right
-(left/right as seen by the server facing the net - a fixed reference).
+Camera assumption: one phone per judged quarter, on a tripod at your
+end of the table on your right-hand edge (phones end up diagonal to each
+other), landscape, framing the whole table. Calibration taps are positional
+— given from YOUR end as you face the table, same order on both phones:
+  1. near-right, 2. near-left, 3. far-left, 4. far-right
+Because both phones tap positionally, each phone's own quarter always lands
+on the same warp slot (bottom-right). There is no per-phone mode or quarter
+selection: the verdict is always "bounce inside tap-1 quad (+line pad) ->
+IN, else FAULT", identical on both phones. Cross-half bounces never enter
+the quarter-cropped track, so no ignore-other-half logic is needed.
 We warp the table to a top-down rectangle with a 4-point homography.
 After warp:
   - table rect: (0,0) - (W,H), net at y=H/2, centre line at x=W/2
-  - server at bottom (y>H/2), receiver at top (y<H/2)
-  - server-right  = bottom-right quadrant (server-centric right)
-  - receiver-right (diagonal, receiver's own right) = top-left quadrant
-    (server-centric left, far end)
+  - own end at bottom (y>H/2), far end at top (y<H/2)
+  - my quarter (tap-1, near-right) = bottom-right warp quadrant
 
-Single-quarter judging (no per-phone mode setting): at START SERVE the app
-auto-picks the nearest quarter to the camera = the quad with the largest
-image area (true when each phone stands by its own quarter); tapping the
-preview while idle claims whichever quarter was tapped. The verdict is then
-just "bounce inside my quad (+line pad) -> IN, else FAULT", identical for
-both phones. Cross-half bounces never enter the quarter-cropped track, so
-no explicit ignore-other-half logic is needed.
+Naming note: quadrant names below ("server_right", ...) are SLOT-based,
+not physical — "server_right" always means the tap-1 (near-right) quadrant,
+i.e. MY quarter on every phone. They are kept so geometry code stays
+unchanged; user-facing strings say "my quarter" instead.
 """
 from collections import deque
 import cv2
@@ -50,10 +49,10 @@ def order_corners(pts):
 class TableMapper:
     """4-click calibration -> homography to top-down view.
 
-    Preferred: set_corners_table_order() with taps in fixed table-centric
-    order (server-right, server-left, receiver-left, receiver-right,
-    left/right from the server's perspective). Works from the side of the
-    table (or either end).
+    Preferred: set_corners_table_order() with taps in positional order from
+    your own end as you face the table (near-right, near-left, far-left,
+    far-right). Same order on both phones; each phone's own quarter always
+    lands on the warp bottom-right slot.
     Legacy: set_corners() auto-orders 4 unordered taps; only reliable for
     the behind-server end view.
     """
@@ -64,18 +63,18 @@ class TableMapper:
         if corners_bgr_ordered is not None:
             self.set_corners(corners_bgr_ordered)
 
-    def set_corners_table_order(self, server_right, server_left,
-                                receiver_left, receiver_right):
-        """Set homography from 4 taps in table-centric order.
+    def set_corners_table_order(self, near_right, near_left,
+                                far_left, far_right):
+        """Set homography from 4 taps in positional order.
 
-        Args are (x, y) camera pixels:
-          server_right:   near end, server's right  -> warp (W, H)
-          server_left:    near end, server's left   -> warp (0, H)
-          receiver_left:  far end, server-side left -> warp (0, 0)
-          receiver_right: far end, server-side right-> warp (W, 0)
+        Args are (x, y) camera pixels, tapped from your own end:
+          near_right: your end, your right -> warp (W, H) (MY quarter)
+          near_left:  your end, your left  -> warp (0, H)
+          far_left:   far end, same edge   -> warp (0, 0)
+          far_right:  far end, same edge   -> warp (W, 0)
         """
-        src = np.array([server_right, server_left,
-                        receiver_left, receiver_right], dtype=np.float32)
+        src = np.array([near_right, near_left,
+                        far_left, far_right], dtype=np.float32)
         # Clockwise in warp space would be BR, BL, TL, TR; cv2 needs
         # matching src->dst pairs, order among pairs does not matter.
         dst = np.array([[WARP_W, WARP_H], [0, WARP_H],
@@ -103,13 +102,10 @@ class TableMapper:
     def quadrant(self, x, y, behind_server=True):
         """Return 'server_right' / 'server_left' / 'receiver_right' / 'receiver_left'.
 
-        Quadrants are fixed in warp space (table-centric, left/right from
-        the server's perspective): server side is y>H/2, receiver side
-        y<H/2; right is x>W/2. The receiver's own right half is the
-        top-left quadrant (diagonally opposite server-right).
-        The camera viewpoint (end/side, either end) is encoded in the
-        calibration taps, so no flip is applied here. `behind_server` is
-        kept for backwards compatibility and ignored.
+        Names are SLOT-based (see module docstring): 'server_right' always
+        means the tap-1 (near-right) quadrant = MY quarter on every phone.
+        Geometry: own end is y>H/2, far end y<H/2; right is x>W/2.
+        `behind_server` is kept for backwards compatibility and ignored.
         """
         tx, ty = self.to_table(x, y)
         is_server_side = ty > WARP_H / 2
@@ -146,9 +142,9 @@ class TableMapper:
     def quarter_poly(self, quadrant):
         """Camera-pixel polygon of one quadrant (4x2 float32) or None.
 
-        Keeps the 4-corner calibration (needed for a stable homography) and
-        derives the quadrant from it via H^-1, so centre/net line tolerance
-        stays consistent with quadrant().
+        The judged quadrant is always "server_right" (the tap-1 slot = MY
+        quarter on every phone). Derived from the 4-corner calibration via
+        H^-1, so centre/net line tolerance stays consistent with quadrant().
         """
         if self.H is None:
             return None
@@ -159,39 +155,6 @@ class TableMapper:
         warp = self.quarter_warp_quad(quadrant).reshape(1, 4, 2)
         cam = cv2.perspectiveTransform(warp, h_inv.astype(np.float32))[0]
         return np.asarray(cam, dtype=np.float32)
-
-    def quarter_polys(self):
-        """All four (name, camera-pixel polygon) pairs, or [] if uncalibrated."""
-        out = []
-        for name in ("server_right", "server_left",
-                     "receiver_right", "receiver_left"):
-            poly = self.quarter_poly(name)
-            if poly is None:
-                return []
-            out.append((name, poly))
-        return out
-
-    def pick_nearest_quarter(self):
-        """Auto-pick the phone's quarter: largest image-area quad.
-
-        True when each phone stands on the long edge bordering its own
-        quarter (diagonal placement): its quad is closest to the camera and
-        renders biggest. Tie-break: lowest centroid (closest to the frame
-        bottom, i.e. the near edge). Returns (name, info_str) or (None,
-        reason) if uncalibrated. The caller should show the pick on screen
-        so a wrong guess is obvious; tapping the preview overrides it.
-        """
-        polys = self.quarter_polys()
-        if not polys:
-            return None, "uncalibrated"
-        scored = []
-        for name, poly in polys:
-            area = abs(float(cv2.contourArea(poly.astype(np.float32))))
-            cy = float(poly[:, 1].mean())
-            scored.append((area, cy, name))
-        scored.sort(key=lambda t: (-t[0], t[1]))
-        areas = ", ".join(f"{n}={a:.0f}" for a, _, n in scored)
-        return scored[0][2], f"areas(px): {areas}"
 
     def quarter_table_rect(self, quadrant, pad=10.0):
         """Warp-space rect (x0, y0, x1, y1) of one quadrant + pad.
@@ -494,12 +457,13 @@ class BallTracker:
 class ServeCaller:
     """State machine: IDLE -> SERVE_LIVE -> DECIDED. Call reset() per serve.
 
-    Single-quarter judging (no modes): `want` is this phone's quadrant
-    (auto-picked as nearest-to-camera at START SERVE, tap to override).
+    No modes, no quarter selection: both phones tap positionally from their
+    own end, so MY quarter is always the tap-1 warp slot ("server_right").
     The first bounce seen inside the quarter-cropped track is judged:
-    inside `want` (+line pad, centre/net lines count IN) -> IN, anything
+    inside my quad (+line pad, centre/net lines count IN) -> IN, anything
     else (wrong half or off table) -> FAULT. Cross-half bounces never enter
-    the cropped track, so no ignore-other-half logic is needed.
+    the cropped track, so no ignore-other-half logic is needed. `want` is
+    kept (default "server_right") only so tests can probe other quads.
     """
 
     QUADRANTS = ("server_right", "server_left",
@@ -596,11 +560,11 @@ class ServeCaller:
         q = self.bounces[-1][2]
         if q == "off_table":
             self.verdict, self.state = "FAULT", "DECIDED"
-            self.reason = f"bounce off table, need {want}"
+            self.reason = "bounce off table: FAULT"
             return
         if inside:
             self.verdict, self.state = "IN", "DECIDED"
-            self.reason = f"bounce in {q}, want {want}"
+            self.reason = "bounce in my quarter: IN"
         else:
             self.verdict, self.state = "FAULT", "DECIDED"
-            self.reason = f"bounce in {q}, need {want}"
+            self.reason = "bounce outside my quarter: FAULT"
