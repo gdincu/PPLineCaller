@@ -54,6 +54,12 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * **SIDE: receiver half (B2):** ignores server-side bounces (bounce 1 belongs to the other phone) and judges the first receiver-side bounce (must be `receiver_right`). Use on the receiver-half side phone.
 * Bounces outside the calibrated table (`off_table`) count as **FAULT** for the phone responsible for that half.
 
+### 5. 30 FPS notes (quarter-ROI, streaks, exposure)
+* Each phone processes only its own quarter (`TableMapper.quarter_poly` + bbox crop, ~1/5 pixels) but keeps the 4-corner homography so net/centre lines stay consistent. Bounce is refined to the between-frame midpoint in table space with a line pad (centre line = IN).
+* Fast serves streak (aspect 2-4): detector has a `round` + `streak` path (`Streak circ >=`, `Streak aspect <=` in TUNING). Streak fill is judged against the enclosing rect, not the enclosing circle.
+* Tracker defaults are 30 FPS-tuned (`Track jump` 180px, `Confirm hits` 1, 2-frame constant-velocity coast). Watch `logcat` `tick avg=..ms` — it must stay under ~33ms to actually process 30 FPS.
+* Exposure: the app best-effort locks AE/AWB, fixes focus, and picks the fastest preview FPS range via pyjnius (see `_lock_exposure`). Short shutter darkens the image, so play under strong hall lighting; if the ball vanishes, lower `White V min` in TUNING.
+
 ---
 
 ## Acknowledgments & References
