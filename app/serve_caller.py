@@ -6,9 +6,10 @@ Doubles serve rule (ITTF 2.6.3, simplified):
 
 Android-only: runs as an APK (Kivy + OpenCV). No desktop/webcam path.
 
-Camera assumption: phone on tripod on the side of the table by your half,
-framing the whole table (wide enough to see faults). Calibration taps are
-given in fixed table-centric order so the side viewpoint works:
+Camera assumption: one phone per judged quarter, on a tripod on the
+long edge bordering that quarter (phones end up diagonal to each other),
+landscape, framing the whole table. Calibration taps are given in fixed
+table-centric order so the side viewpoint works:
   1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right
 (left/right as seen by the server facing the net - a fixed reference).
 We warp the table to a top-down rectangle with a 4-point homography.
@@ -19,12 +20,13 @@ After warp:
   - receiver-right (diagonal, receiver's own right) = top-left quadrant
     (server-centric left, far end)
 
-Device modes (see ServeCaller, one phone per side):
-  - "server": phone on the side by the server half, judges bounce 1 only
-    (must be server-right).
-  - "receiver": phone on the side by the receiver half, ignores the
-    server-side bounce and judges the first receiver-side bounce only
-    (must be receiver-right).
+Single-quarter judging (no per-phone mode setting): at START SERVE the app
+auto-picks the nearest quarter to the camera = the quad with the largest
+image area (true when each phone stands by its own quarter); tapping the
+preview while idle claims whichever quarter was tapped. The verdict is then
+just "bounce inside my quad (+line pad) -> IN, else FAULT", identical for
+both phones. Cross-half bounces never enter the quarter-cropped track, so
+no explicit ignore-other-half logic is needed.
 """
 from collections import deque
 import cv2
@@ -123,22 +125,29 @@ class TableMapper:
         _, ty = self.to_table(x, y)
         return "server" if ty > WARP_H / 2 else "receiver"
 
-    def quarter_warp_quad(self, mode):
-        """Warp-space rect of the judged quarter. Mode: 'server'|'receiver'."""
+    def quarter_warp_quad(self, quadrant):
+        """Warp-space rect of one quadrant. Quadrant: 'server_right' |
+        'server_left' | 'receiver_right' | 'receiver_left' (see quadrant()).
+        """
         hw, hh = WARP_W / 2.0, WARP_H / 2.0
-        if mode == "receiver":
-            # receiver-right = top-left (diagonal from server-right)
-            return np.array([[0, 0], [hw, 0], [hw, hh], [0, hh]],
-                            dtype=np.float32)
-        # server-right = bottom-right
-        return np.array([[hw, hh], [WARP_W, hh],
-                         [WARP_W, WARP_H], [hw, WARP_H]], dtype=np.float32)
+        quads = {
+            "server_right": [[hw, hh], [WARP_W, hh],
+                             [WARP_W, WARP_H], [hw, WARP_H]],
+            "server_left": [[0, hh], [hw, hh], [hw, WARP_H], [0, WARP_H]],
+            "receiver_right": [[0, 0], [hw, 0], [hw, hh], [0, hh]],
+            "receiver_left": [[hw, 0], [WARP_W, 0],
+                              [WARP_W, hh], [hw, hh]],
+        }
+        if quadrant not in quads:
+            raise ValueError(f"quadrant must be one of {sorted(quads)}, "
+                             f"got {quadrant!r}")
+        return np.array(quads[quadrant], dtype=np.float32)
 
-    def quarter_poly(self, mode):
-        """Camera-pixel polygon of the judged quarter (4x2 float32) or None.
+    def quarter_poly(self, quadrant):
+        """Camera-pixel polygon of one quadrant (4x2 float32) or None.
 
         Keeps the 4-corner calibration (needed for a stable homography) and
-        derives the quarter from it via H^-1, so centre/net line tolerance
+        derives the quadrant from it via H^-1, so centre/net line tolerance
         stays consistent with quadrant().
         """
         if self.H is None:
@@ -147,17 +156,50 @@ class TableMapper:
             h_inv = np.linalg.inv(self.H)
         except np.linalg.LinAlgError:
             return None
-        warp = self.quarter_warp_quad(mode).reshape(1, 4, 2)
+        warp = self.quarter_warp_quad(quadrant).reshape(1, 4, 2)
         cam = cv2.perspectiveTransform(warp, h_inv.astype(np.float32))[0]
         return np.asarray(cam, dtype=np.float32)
 
-    def quarter_table_rect(self, mode, pad=10.0):
-        """Warp-space rect (x0, y0, x1, y1) of the judged quarter + pad.
+    def quarter_polys(self):
+        """All four (name, camera-pixel polygon) pairs, or [] if uncalibrated."""
+        out = []
+        for name in ("server_right", "server_left",
+                     "receiver_right", "receiver_left"):
+            poly = self.quarter_poly(name)
+            if poly is None:
+                return []
+            out.append((name, poly))
+        return out
 
-        Used to judge line balls as IN: the pad expands the wanted quarter
+    def pick_nearest_quarter(self):
+        """Auto-pick the phone's quarter: largest image-area quad.
+
+        True when each phone stands on the long edge bordering its own
+        quarter (diagonal placement): its quad is closest to the camera and
+        renders biggest. Tie-break: lowest centroid (closest to the frame
+        bottom, i.e. the near edge). Returns (name, info_str) or (None,
+        reason) if uncalibrated. The caller should show the pick on screen
+        so a wrong guess is obvious; tapping the preview overrides it.
+        """
+        polys = self.quarter_polys()
+        if not polys:
+            return None, "uncalibrated"
+        scored = []
+        for name, poly in polys:
+            area = abs(float(cv2.contourArea(poly.astype(np.float32))))
+            cy = float(poly[:, 1].mean())
+            scored.append((area, cy, name))
+        scored.sort(key=lambda t: (-t[0], t[1]))
+        areas = ", ".join(f"{n}={a:.0f}" for a, _, n in scored)
+        return scored[0][2], f"areas(px): {areas}"
+
+    def quarter_table_rect(self, quadrant, pad=10.0):
+        """Warp-space rect (x0, y0, x1, y1) of one quadrant + pad.
+
+        Used to judge line balls as IN: the pad expands the wanted quadrant
         across the centre/net lines by ~half a line width in warp px.
         """
-        q = self.quarter_warp_quad(mode)
+        q = self.quarter_warp_quad(quadrant)
         x0, y0 = float(q[:, 0].min()), float(q[:, 1].min())
         x1, y1 = float(q[:, 0].max()), float(q[:, 1].max())
         return (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
@@ -373,6 +415,8 @@ class BallTracker:
         self._cand_streak = 0
         self._missed = 0
         self._vel = None  # (vx, vy) full-res px/frame
+        self._real = None  # last accepted REAL detection (never a coast guess)
+        self._gap = 0  # frames elapsed since _real (0 when pos is real)
 
     def reset(self):
         self.pos = None
@@ -380,6 +424,8 @@ class BallTracker:
         self._cand_streak = 0
         self._missed = 0
         self._vel = None
+        self._real = None
+        self._gap = 0
 
     def update(self, det_or_none):
         """Feed a raw (x, y[, r]) detection or None. Returns accepted (x, y) or None."""
@@ -392,6 +438,7 @@ class BallTracker:
                 vx, vy = self._vel
                 if abs(vx) + abs(vy) <= self.max_jump * 2.0:
                     self.pos = (self.pos[0] + vx, self.pos[1] + vy)
+                    self._gap += 1
                     return self.pos
             if self._missed > self.drop_after_missed:
                 self.reset()
@@ -403,9 +450,29 @@ class BallTracker:
             if np.hypot(dx, dy) <= self.max_jump:
                 self._vel = (dx, dy)
                 self.pos = (x, y)
+                self._real = (x, y)
+                self._gap = 0
                 return self.pos
+            if self._real is not None:
+                # Post-coast correction: if the missed frame straddled the
+                # bounce, the coast guess kept going DOWN while the real ball
+                # came back UP, so the detection lands far from the guess.
+                # Accept it against the last REAL point (wider window) and
+                # recompute per-frame velocity over the gap, instead of
+                # declaring a teleport and restarting the track (which hid
+                # the bounce for 1-2 extra frames).
+                dr = np.hypot(x - self._real[0], y - self._real[1])
+                if dr <= self.max_jump * 1.25:
+                    n = max(self._gap + 1, 1)
+                    self._vel = ((x - self._real[0]) / n, (y - self._real[1]) / n)
+                    self.pos = (x, y)
+                    self._real = (x, y)
+                    self._gap = 0
+                    return self.pos
             self.pos = None  # teleport: restart acquisition below
             self._vel = None
+            self._real = None
+            self._gap = 0
         if (self._cand is not None
                 and np.hypot(x - self._cand[0], y - self._cand[1]) <= self.max_jump):
             self._cand_streak += 1
@@ -416,6 +483,8 @@ class BallTracker:
             if self._cand is not None and self._cand_streak > 1:
                 self._vel = (x - self._cand[0], y - self._cand[1])
             self.pos = (x, y)
+            self._real = (x, y)
+            self._gap = 0
             self._cand = None
             self._cand_streak = 0
             return self.pos
@@ -425,25 +494,25 @@ class BallTracker:
 class ServeCaller:
     """State machine: IDLE -> SERVE_LIVE -> DECIDED. Call reset() per serve.
 
-    Modes (one phone per side, side of the table):
-      "server":   side phone by the server half; judges the FIRST bounce
-                 only (must be server_right). Ignores everything after.
-      "receiver": side phone by the receiver half; ignores server-side
-                 bounces (bounce 1) and judges the first receiver-side
-                 bounce (must be receiver_right).
-    Off-table bounces (outside the calibrated quad) are FAULT for the
-    phone responsible for that half.
+    Single-quarter judging (no modes): `want` is this phone's quadrant
+    (auto-picked as nearest-to-camera at START SERVE, tap to override).
+    The first bounce seen inside the quarter-cropped track is judged:
+    inside `want` (+line pad, centre/net lines count IN) -> IN, anything
+    else (wrong half or off table) -> FAULT. Cross-half bounces never enter
+    the cropped track, so no ignore-other-half logic is needed.
     """
 
-    MODES = ("server", "receiver")
+    QUADRANTS = ("server_right", "server_left",
+                 "receiver_right", "receiver_left")
 
-    def __init__(self, table: TableMapper, behind_server=True, mode="server",
-                 min_drop=3.0, min_rise=3.0, line_pad=10.0):
-        if mode not in self.MODES:
-            raise ValueError(f"mode must be one of {self.MODES}, got {mode!r}")
+    def __init__(self, table: TableMapper, want="server_right",
+                 behind_server=True, min_drop=3.0, min_rise=3.0,
+                 line_pad=10.0):
+        if want not in self.QUADRANTS:
+            raise ValueError(f"want must be one of {self.QUADRANTS}, got {want!r}")
         self.table = table
         self.behind_server = behind_server  # legacy, unused (orientation is in taps)
-        self.mode = mode
+        self.want = want
         self.min_drop = float(min_drop)
         self.min_rise = float(min_rise)
         self.line_pad = float(line_pad)  # warp-px across centre/net lines counting IN
@@ -475,10 +544,10 @@ class ServeCaller:
         return mx, my, tx, ty
 
     def _inside_wanted(self, tx, ty):
-        """True if table point is inside this phone's judged quarter (+pad)."""
+        """True if table point is inside this phone's quarter (+pad)."""
         try:
             x0, y0, x1, y1 = self.table.quarter_table_rect(
-                self.mode, pad=self.line_pad)
+                self.want, pad=self.line_pad)
         except Exception:
             return False
         return x0 <= tx <= x1 and y0 <= ty <= y1
@@ -503,12 +572,6 @@ class ServeCaller:
                 mx, my, tx, ty = refined
                 q = self.table.quadrant(mx, my)
                 on_table = self.table.inside_table(mx, my)
-                if self.mode == "receiver" and self.table.side(mx, my) == "server":
-                    # bounce 1 happened on the other phone's half: ignore it
-                    # (but keep trajectory continuity for the next bounce).
-                    self.traj.clear()
-                    self.traj.append(ball_xy_or_none)
-                    return self.verdict
                 # debounce: ignore same-quadrant double counts within 5 frames
                 if not self.bounces or self.bounces[-1][2] != q or not on_table:
                     label = q if on_table else "off_table"
@@ -519,11 +582,7 @@ class ServeCaller:
         return self.verdict
 
     def _judge(self):
-        if self.mode == "receiver":
-            # only receiver-side bounces reach here (server side ignored above)
-            self._judge_single("receiver_right")
-        else:
-            self._judge_single("server_right")
+        self._judge_single(self.want)
 
     def _judge_single(self, want):
         # Quarter check in table space (+line pad) is the verdict; the
@@ -541,7 +600,7 @@ class ServeCaller:
             return
         if inside:
             self.verdict, self.state = "IN", "DECIDED"
-            self.reason = f"bounce in {q}, OK for {self.mode} phone"
+            self.reason = f"bounce in {q}, want {want}"
         else:
             self.verdict, self.state = "FAULT", "DECIDED"
             self.reason = f"bounce in {q}, need {want}"

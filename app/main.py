@@ -4,22 +4,24 @@ Android-only: built as an APK via the GitHub Action (buildozer). There is
 no desktop/webcam path.
 
 Flow:
-  1. Fix the phone on the side of the table by your half (tripod,
-     landscape), framing the whole table.
-  2. Pick this phone's side (one phone per side, one quarter each):
-       SIDE: server half (B1)   -> judges bounce 1 in server-right only
-       SIDE: receiver half (B2) -> judges bounce 2 in receiver-right only
-  3. Tap CALIBRATE then tap the 4 table corners IN ORDER:
+  1. Fix the phone on the side of the table by your quarter (tripod,
+     landscape), on the long edge bordering the quarter you judge,
+     framing the whole table.
+  2. Tap CALIBRATE then tap the 4 table corners IN ORDER:
        1. SERVER-RIGHT (near end, server's right)
        2. SERVER-LEFT  (near end, server's left)
        3. RECEIVER-LEFT (far end, same long edge as 2)
        4. RECEIVER-RIGHT (far end, same long edge as 1)
      Left/right are fixed from the server's perspective facing the net, so
      the order works from the end or the side, either end of the table.
-  4. Tap START SERVE, serve, app speaks/shows IN or FAULT.
+  3. At START SERVE the app auto-picks the nearest quarter to the camera
+     (or tap the preview while idle to claim yours), then judges the first
+     bounce seen: inside my quarter -> IN, else FAULT. Tap START SERVE,
+     serve, app speaks/shows IN or FAULT.
 """
 import cv2
 import numpy as np
+import threading
 from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.graphics.texture import Texture
@@ -28,7 +30,6 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.image import Image
-from kivy.uix.spinner import Spinner
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
@@ -48,11 +49,6 @@ CALIB_STEPS = (
 )
 # Short tags drawn next to each tapped point on the preview.
 CALIB_SHORT = ("1 SR", "2 SL", "3 RL", "4 RR")
-
-ROLE_OPTIONS = {
-    "SIDE: server half (B1)": "server",
-    "SIDE: receiver half (B2)": "receiver",
-}
 
 # Live-tuning panel (collapsed by default). Defaults equal the hardcoded
 # detector/tracker/bounce settings. Row format:
@@ -85,10 +81,48 @@ TUNE_DEFAULTS = {
 }
 
 
+class PreviewImage(Image):
+    """Camera preview: taps drive calibration/quarter-claim, swipe-down
+    collapses the tuning drawer.
+
+    Tap vs swipe is decided on touch-up (movement < 12dp = tap). The swipe
+    lives here — not on the tuning drawer, where it would fight the
+    ScrollView — and taps are ignored mid-serve exactly as before.
+    """
+
+    def __init__(self, app, **kwargs):
+        super().__init__(**kwargs)
+        self._app = app
+        self._down = None
+
+    def on_touch_down(self, touch):
+        if self.collide_point(touch.x, touch.y):
+            self._down = (touch.x, touch.y, touch.uid)
+        return super().on_touch_down(touch)
+
+    def on_touch_up(self, touch):
+        d = self._down
+        if d is not None and touch.uid == d[2]:
+            self._down = None
+            if self.collide_point(touch.x, touch.y):
+                dx, dy = touch.x - d[0], touch.y - d[1]
+                if (self._app.tuning_open and dy < -dp(60)
+                        and abs(dx) < dp(40)):
+                    self._app.toggle_tuning()
+                    return True
+                if abs(dx) < dp(12) and abs(dy) < dp(12):
+                    return self._app.on_preview_tap(self, touch)
+        return super().on_touch_up(touch)
+
+
 class ServeApp(App):
     def build(self):
         self.table = TableMapper()
-        self.caller = ServeCaller(self.table, mode="server")
+        self.caller = ServeCaller(self.table, want="server_right")
+        # This phone's judged quadrant + how it was chosen ("auto"/"tap").
+        self.want = "server_right"
+        self._want_src = "default"
+        self._want_locked = False
         self.calib_pts = []
         self.calibrating = False
         # Android capture via Kivy's camera provider (pyjnius -> Camera API),
@@ -106,12 +140,12 @@ class ServeApp(App):
         self._tick_ms_ema = 0.0
         self._render_every = 2
         self._exposure_locked = False
-        # Focus: "locked" (fixed/infinity, no hunting during serve) vs
-        # "auto" (continuous-video/picture for framing/calibration).
-        # Old Camera API has no true manual diopter control, so "manual"
-        # here means lock at fixed/infinity. Applied live via pyjnius.
-        self._focus_mode = "locked"
-        self.focus_btn = None
+        self._tts_thread = None
+        # Focus: always locked (fixed/infinity first) — no hunting mid-serve.
+        # Continuous AF was tried but hunted in bad hall light; a frozen
+        # focus plane tests better once the table is framed. Applied once
+        # via pyjnius; falls back to continuous AF if the device has no
+        # fixed/infinity/edof mode.
         self.tuning_open = False
         self._tune_sliders = {}
         self._tune_values = {}
@@ -120,31 +154,25 @@ class ServeApp(App):
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
         # so the preview is as large as possible; taps are mapped through
-        # the displayed rect (norm_image_size) in on_tap.
-        self.view = Image(allow_stretch=True, keep_ratio=True)
-        self.view.bind(on_touch_down=self.on_tap)
-        self.status = Label(text="Pick side, tap CALIBRATE, then 4 corners in order",
+        # the displayed rect (norm_image_size) in on_preview_tap.
+        # PreviewImage also turns a swipe-down into tuning collapse.
+        self.view = PreviewImage(self, allow_stretch=True, keep_ratio=True)
+        self.status = Label(text="Tap CALIBRATE, then 4 corners in order",
                             size_hint_y=0.12)
 
         cfg = BoxLayout(size_hint_y=0.12)
-        self.role_spinner = Spinner(text="SIDE: server half (B1)",
-                                    values=tuple(ROLE_OPTIONS.keys()),
-                                    size_hint_x=0.6)
-        cfg.add_widget(self.role_spinner)
-        self.focus_btn = Button(text="FOCUS: LOCKED", size_hint_x=0.4)
-        self.focus_btn.bind(on_press=self.cycle_focus)
-        cfg.add_widget(self.focus_btn)
+        self.want_label = Label(text="MY QUARTER: ?")
+        cfg.add_widget(self.want_label)
+        self.cfg_row = cfg
 
         bar = BoxLayout(size_hint_y=0.12)
         b_cal = Button(text="CALIBRATE")
         b_cal.bind(on_press=self.start_calib)
         b_go = Button(text="START SERVE")
         b_go.bind(on_press=self.start_serve)
-        b_rst = Button(text="RESET")
-        b_rst.bind(on_press=lambda *_: self.start_serve())
         bar.add_widget(b_cal)
         bar.add_widget(b_go)
-        bar.add_widget(b_rst)
+        self.action_row = bar
 
         root.add_widget(self.view)
         root.add_widget(self.status)
@@ -186,13 +214,46 @@ class ServeApp(App):
         return root
 
     # -- config ---------------------------------------------------------
-    def _current_mode(self):
-        return ROLE_OPTIONS.get(self.role_spinner.text, "server")
+    def _set_want(self, want, src):
+        """Set this phone's judged quadrant + refresh label/caller/track."""
+        self.want = want
+        self._want_src = src
+        if getattr(self, "want_label", None) is not None:
+            self.want_label.text = f"MY QUARTER: {want.upper()} ({src})"
+        if getattr(self, "table", None) is not None and self.table.H is not None:
+            self.caller = ServeCaller(self.table, want=want,
+                                      min_drop=self.params["min_drop"],
+                                      min_rise=self.params["min_rise"])
+            if getattr(self, "tracker", None) is not None:
+                self.tracker.reset()
+            self._prev_small = None  # new crop => fresh motion reference
+
+    def _auto_pick_want(self):
+        """Pick nearest-to-camera quadrant; returns (name, info)."""
+        return self.table.pick_nearest_quarter()
 
     def toggle_tuning(self, *_):
+        # Opening the drawer hides the quarter label + action rows: a fixed
+        # 320dp drawer inside a proportional BoxLayout otherwise squeezes
+        # every button row tiny. The drawer + preview keep full size, and
+        # the toggle stays put as a big close handle (plus swipe-down on
+        # the preview also collapses).
         self.tuning_open = not self.tuning_open
-        self.tune_toggle.text = "TUNING -" if self.tuning_open else "TUNING +"
-        self.tune_scroll.height = dp(320) if self.tuning_open else 0
+        if self.tuning_open:
+            self.tune_toggle.text = "TUNING - CLOSE"
+            for w in (self.cfg_row, self.action_row):
+                w.size_hint_y = None
+                w.height = 0
+                w.disabled = True
+                w.opacity = 0
+            self.tune_scroll.height = dp(320)
+        else:
+            self.tune_toggle.text = "TUNING +"
+            for w in (self.cfg_row, self.action_row):
+                w.size_hint_y = 0.12
+                w.disabled = False
+                w.opacity = 1
+            self.tune_scroll.height = 0
 
     def reset_tuning(self, *_):
         for key in self._tune_sliders:
@@ -223,77 +284,100 @@ class ServeApp(App):
         self.calib_pts = []
         self.calibrating = True
         self._prev_small = None  # bbox changes after re-calibration
-        # Autofocus for framing/tapping corners; lock again on START SERVE.
-        self._focus_mode = "auto"
-        if self.focus_btn is not None:
-            self.focus_btn.text = "FOCUS: AUTO"
-        ok, msg = self.apply_focus_mode("auto")
-        self.status.text = (f"Tap 1/4: {CALIB_STEPS[0]} (focus auto: {msg})" if ok
-                            else f"Tap 1/4: {CALIB_STEPS[0]}")
+        self._want_locked = False  # re-pick quarter for the new framing
+        self.status.text = f"Tap 1/4: {CALIB_STEPS[0]}"
 
-    def on_tap(self, img, touch):
-        if not self.calibrating or getattr(self, "frame", None) is None:
-            return False
-        if not img.collide_point(touch.x, touch.y):
-            return False
+    def _tap_to_frame(self, img, touch):
+        """Window touch -> frame (x, y) pixels, or None if outside the image.
+
+        The frame is letterboxed inside the widget (keep_ratio); only the
+        centred norm_image_size rect shows the camera image.
+        """
         h, w = self.frame.shape[:2]
-        # touch is in window coords; the Image widget sits above the status
-        # label + buttons, so subtract its position to get widget-local
-        # coords (origin bottom-left of the widget). NOTE: do NOT use
-        # img.to_widget() here: with the default relative=False it returns
-        # the point unchanged for plain widgets (no subtraction), which put
-        # every marker one widget-height too high.
         lx = touch.x - img.x
         ly = touch.y - img.y
-        # The frame is letterboxed inside the widget (keep_ratio); only the
-        # centred norm_image_size rect shows the camera image.
         tw, th = img.norm_image_size
         if tw <= 0 or th <= 0:
-            return False
+            return None
         x0 = (img.width - tw) / 2.0
         y0 = (img.height - th) / 2.0
         if not (x0 <= lx <= x0 + tw and y0 <= ly <= y0 + th):
-            self.status.text = (f"Tap inside the camera view "
-                                f"({len(self.calib_pts)}/4: {CALIB_STEPS[len(self.calib_pts)]})")
-            return True
+            return None
         u = (lx - x0) / tw   # 0 = left edge of frame
         v = (ly - y0) / th   # 1 = top edge of displayed image
-        x = u * w
-        y = (1.0 - v) * h    # frame row 0 is the top of the camera image
-        self.calib_pts.append((x, y))
-        n = len(self.calib_pts)
-        if n < 4:
-            self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
-        else:
-            srv_r, srv_l, recv_l, recv_r = self.calib_pts
-            self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
-            self.caller = ServeCaller(self.table, mode=self._current_mode(),
-                                      min_drop=self.params["min_drop"],
-                                      min_rise=self.params["min_rise"])
-            self.calibrating = False
-            self._prev_small = None  # quarter bbox changed -> fresh motion ref
-            self.status.text = "Calibrated. Tap START SERVE."
+        return u * w, (1.0 - v) * h  # frame row 0 is the top
+
+    def on_preview_tap(self, img, touch):
+        if getattr(self, "frame", None) is None:
+            return False
+        if not img.collide_point(touch.x, touch.y):
+            return False
+        pt = self._tap_to_frame(img, touch)
+        if pt is None:
+            if self.calibrating:
+                self.status.text = (f"Tap inside the camera view "
+                                    f"({len(self.calib_pts)}/4: {CALIB_STEPS[len(self.calib_pts)]})")
+            else:
+                self.status.text = "Tap inside the camera view to claim a quarter."
+            return True
+        x, y = pt
+        if self.calibrating:
+            # touch is in window coords; the Image widget sits above the
+            # status label + buttons, so _tap_to_frame already subtracts the
+            # widget position (origin bottom-left). NOTE: do NOT use
+            # img.to_widget() here: with the default relative=False it
+            # returns the point unchanged for plain widgets (no
+            # subtraction), which put every marker one widget-height high.
+            self.calib_pts.append((x, y))
+            n = len(self.calib_pts)
+            if n < 4:
+                self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
+            else:
+                srv_r, srv_l, recv_l, recv_r = self.calib_pts
+                self.table.set_corners_table_order(srv_r, srv_l, recv_l, recv_r)
+                self.calibrating = False
+                self._want_locked = False
+                pick, info = self._auto_pick_want()
+                self._set_want(pick or "server_right", "auto")
+                Logger.info(f"PPLineCaller: auto-pick quarter: {info}")
+                self.status.text = (f"Calibrated. MY QUARTER: "
+                                    f"{self.want.upper()} (auto). Tap START SERVE, "
+                                    f"or tap another quarter to change it.")
+            return True
+        # Idle tap = claim the tapped quarter (ignored mid-serve).
+        if self.table.H is None:
+            return False
+        if getattr(self.caller, "state", None) == "SERVE_LIVE":
+            self.status.text = ("Serving... after the call, tap a quarter "
+                                "then START SERVE to change it.")
+            return True
+        if not self.table.inside_table(x, y):
+            self.status.text = "Tap inside the table to claim that quarter."
+            return True
+        q = self.table.quadrant(x, y)
+        self._want_locked = True
+        self._set_want(q, "tap")
+        self.status.text = (f"MY QUARTER: {q.upper()} (tap). "
+                            f"Tap START SERVE when ready.")
         return True
 
     def start_serve(self, *_):
         if self.table.H is None:
             self.status.text = "Calibrate first (4 corners in order)."
             return
-        # Lock focus before the serve so low light can't hunt mid-rally.
-        self._focus_mode = "locked"
-        if self.focus_btn is not None:
-            self.focus_btn.text = "FOCUS: LOCKED"
-        self.apply_focus_mode("locked")
-        self.caller = ServeCaller(self.table, mode=self._current_mode(),
-                                  min_drop=self.params["min_drop"],
-                                  min_rise=self.params["min_rise"])
+        # Nearest quarter is auto-picked unless tapped after calibration.
+        if not self._want_locked:
+            pick, info = self._auto_pick_want()
+            self._set_want(pick or "server_right", "auto")
+            Logger.info(f"PPLineCaller: auto-pick quarter: {info}")
         self.caller.reset()
         self.tracker.reset()
         self._prev_small = None  # fresh motion reference per serve
         self._said = False
         self._tick_count = 0
         self._tick_ms_ema = 0.0
-        self.status.text = f"Watching serve [{self.caller.mode}]..."
+        self.status.text = (f"Watching [{self.caller.want}]... "
+                            f"bounces={len(self.caller.bounces)}")
 
     # -- android camera -------------------------------------------------
     def on_start(self):
@@ -320,10 +404,11 @@ class ServeApp(App):
             self.cam = CoreCamera(index=0, resolution=(1280, 720))
             self.cam.start()
             self._lock_exposure()
-            ok, msg = self.apply_focus_mode(self._focus_mode)
-            if self.focus_btn is not None:
-                self.focus_btn.text = f"FOCUS: {self._focus_mode.upper()}"
+            ok, msg = self._ensure_focus()
             Logger.info(f"PPLineCaller: initial focus: {msg}")
+            # Warm the TTS engine now (background thread) so the first
+            # verdict's "In"/"Fault" doesn't pay the 1-3s init cost.
+            self.say("Ready")
         except Exception as e:
             self.status.text = f"Camera error: {e}"
 
@@ -334,11 +419,11 @@ class ServeApp(App):
         50 km/h serve into a faint streak. Forcing a short exposure keeps
         the frame rate at 30 FPS but sharpens the blob/ellipse. Old Camera
         API has no direct shutter-time call, so we: lock AE + white balance,
-        apply the current focus mode (locked by default, no hunting),
         nudge exposure-compensation down, and request the fastest preview
-        FPS range the device reports. All best-effort: any failure only
-        logs. Compensate darkness with strong hall lighting (preferred) or
-        lower white_v_min via TUNING.
+        FPS range the device reports. (Focus is handled separately in
+        _ensure_focus: always continuous AF.) All best-effort: any failure
+        only logs. Compensate darkness with strong hall lighting (preferred)
+        or lower white_v_min via TUNING.
         """
         if self._exposure_locked:
             return
@@ -388,32 +473,22 @@ class ServeApp(App):
         except Exception as e:
             Logger.info(f"PPLineCaller: exposure experiment skipped: {e}")
 
-    def cycle_focus(self, *_):
-        """Toggle FOCUS: LOCKED <-> AUTO from the UI button."""
-        self._focus_mode = "auto" if self._focus_mode == "locked" else "locked"
-        ok, msg = self.apply_focus_mode(self._focus_mode)
-        if self.focus_btn is not None:
-            self.focus_btn.text = f"FOCUS: {self._focus_mode.upper()}"
-        self.status.text = f"Focus {self._focus_mode}: {msg}" if ok else f"Focus failed: {msg}"
+    def _ensure_focus(self):
+        """Lock focus once at startup. Returns (ok, msg).
 
-    def apply_focus_mode(self, mode):
-        """Set android.hardware.Camera focus mode live. Returns (ok, msg).
-
-        locked: fixed -> infinity -> edof (no hunting; best for serves in
-                bad light once the table is framed).
-        auto:   continuous-video -> continuous-picture -> auto (best for
-                framing/calibration; hunts in low light, so lock before serve).
-        True manual diopters need Camera2 LENS_FOCUS_DISTANCE, which Kivy's
-        old-API provider doesn't expose — this is the closest the current
-        stack allows. Safe no-op when camera isn't ready.
+        Prefers fixed -> infinity -> edof: the lens never moves again, so
+        bad hall light can't make it hunt mid-serve. Falls back to
+        continuous-video -> continuous-picture -> auto (with an AF trigger
+        for one-shot auto) on devices with no locked mode. Safe no-op when
+        camera isn't ready.
         """
         if getattr(self, "cam", None) is None:
             return False, "camera not ready"
         cam = getattr(self.cam, "_android_camera", None)
         if cam is None:
             return False, "no _android_camera"
-        want = (["fixed", "infinity", "edof"] if mode == "locked"
-                else ["continuous-video", "continuous-picture", "auto", "macro"])
+        want = ["fixed", "infinity", "edof"]
+        fallback = ["continuous-video", "continuous-picture", "auto", "macro"]
         try:
             params = cam.getParameters()
         except Exception as e:
@@ -427,8 +502,12 @@ class ServeApp(App):
             # Some drivers hide the list but accept setFocusMode anyway.
             pick = want[0]
         if pick is None:
-            msg = f"none of {want} in {supported}"
-            Logger.info(f"PPLineCaller: focus {mode} unsupported: {msg}")
+            # No locked mode on this device: fall back to continuous AF
+            # rather than leaving focus wherever the driver put it.
+            pick = next((m for m in fallback if m in supported), None)
+        if pick is None:
+            msg = f"none of {want + fallback} in {supported}"
+            Logger.info(f"PPLineCaller: focus unsupported: {msg}")
             return False, msg
         try:
             params.setFocusMode(pick)
@@ -445,7 +524,7 @@ class ServeApp(App):
             except Exception as e:
                 Logger.info(f"PPLineCaller: autoFocus trigger skipped: {e}")
         msg = f"{pick} (supported={supported})"
-        Logger.info(f"PPLineCaller: focus {mode} -> {msg}")
+        Logger.info(f"PPLineCaller: focus -> {msg}")
         return True, msg
 
     def _preview_size(self):
@@ -488,10 +567,17 @@ class ServeApp(App):
             return None
 
     def say(self, text):
-        try:
-            tts.speak(text)
-        except Exception:
-            pass
+        """Speak without blocking the 30Hz tick: tts.speak() on Android can
+        take 1-3s (engine init + utterance), which used to stall the whole
+        detection loop and delay the verdict after it was already decided."""
+        def _speak():
+            try:
+                tts.speak(text)
+            except Exception:
+                pass
+        t = threading.Thread(target=_speak, daemon=True)
+        self._tts_thread = t
+        t.start()
 
     def _draw_calib_points(self, frame):
         """Draw each tapped corner (numbered) plus joining lines."""
@@ -519,22 +605,12 @@ class ServeApp(App):
             self._upload(frame)
             return
         if self.table.H is not None:
-            # If the SIDE spinner changed mid-session, re-target immediately:
-            # new quarter poly => fresh motion ref + new caller/tracker.
-            want_mode = self._current_mode()
-            if want_mode != self.caller.mode:
-                self.caller = ServeCaller(self.table, mode=want_mode,
-                                          min_drop=self.params["min_drop"],
-                                          min_rise=self.params["min_rise"])
-                self.caller.reset()
-                self.tracker.reset()
-                self._prev_small = None
             p = self.params
             # Quarter-ROI: only this phone's quarter is processed. Keeps the
             # 4-corner homography (stable lines) but crops HSV/contours to
             # ~1/4 pixels + top_extra for the incoming ball.
-            mode = self.caller.mode if hasattr(self, "caller") else self._current_mode()
-            qpoly = self.table.quarter_poly(mode)
+            want = self.caller.want
+            qpoly = self.table.quarter_poly(want)
             det, curr_small = detect_ball_hsv(
                 frame, self.tracker.pos, table_poly=qpoly,
                 prev_small=self._prev_small, min_area=p["min_area"],
@@ -554,14 +630,14 @@ class ServeApp(App):
             r_draw = int(det[2]) if det else 6
             verdict = self.caller.update(pos)
             if verdict:
-                self.status.text = f"[{self.caller.mode}] {verdict}: {self.caller.reason}"
+                self.status.text = f"[{self.caller.want}] {verdict}: {self.caller.reason}"
                 if not self._said:
                     self.say("In" if verdict == "IN" else "Fault")
                     self._said = True
             else:
                 self._said = False
                 if self.caller.state == "SERVE_LIVE":
-                    self.status.text = (f"Watching [{self.caller.mode}]... "
+                    self.status.text = (f"Watching [{self.caller.want}]... "
                                         f"bounces={len(self.caller.bounces)}")
             # Render throttle: detect every frame, upload overlays at ~15Hz
             # during live rallies (saves flip/cvtColor/tobytes/blit per frame);
@@ -575,6 +651,9 @@ class ServeApp(App):
                 # draw judged quarter (thick) + full table (thin) + bounces
                 if qpoly is not None:
                     cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
+                    cv2.putText(frame, f"MY: {self.caller.want}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 255, 0), 2)
                 cv2.polylines(frame, [self.table.corners.astype(int)], True, (0, 255, 0), 1)
                 for i, (bx, by, q) in enumerate(self.caller.bounces):
                     cv2.circle(frame, (int(bx), int(by)), 8, (255, 0, 0), -1)
@@ -589,7 +668,7 @@ class ServeApp(App):
         if self._tick_count % 60 == 0:
             Logger.info(f"PPLineCaller: tick avg={self._tick_ms_ema:.1f}ms "
                         f"last={ms:.1f}ms n={self._tick_count} "
-                        f"mode={getattr(self.caller, 'mode', '?')} "
+                        f"want={getattr(self.caller, 'want', '?')} "
                         f"bounces={len(getattr(self.caller, 'bounces', []))}")
 
     def _upload(self, frame):

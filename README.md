@@ -11,8 +11,8 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 ## Features
 
 * **Android-only, CPU-Only Performance:** Optimized using classic computer vision (HSV thresholding, circularity filtering, and frame deltas). No heavy GPU requirements, PyTorch, or cloud AI (Roboflow) needed.
-* **4-Point Calibration in fixed table order:** Tap the 4 corners as 1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right (left/right from the server's perspective). Each tap is drawn numbered on the preview.
-* **Side phone position, one quarter each:** Two phones on the side (one per half) each judge a single quarter — `SIDE: server half (B1)` or `SIDE: receiver half (B2)` via one combined setting.
+* **4-Point Calibration in fixed table order:** Tap the 4 corners as 1. server-right, 2. server-left, 3. receiver-left, 4. receiver-right (left/right from the server's perspective). Each tap is drawn numbered on the preview. Full-table mapping is kept (best homography conditioning) even though each phone only judges one quarter.
+* **One phone per quarter, no mode setting:** Place each phone on the long edge bordering its quarter (phones end up diagonal to each other). At START SERVE the app auto-picks the nearest quarter (largest on screen); tap the preview while idle to claim a different quarter. The picked quarter is drawn thick with a `MY:` tag.
 * **Bounce & Trajectory Analysis:** Tracks vertical velocity inversions ($\Delta y_1 > 0 \rightarrow \Delta y_2 < 0$) to accurately locate bounce points on the table.
 * **ITTF Doubles Rule Verification:** Validates that doubles serve bounce 1 occurs in the Server's Right half and bounce 2 lands diagonally in the Receiver's Right half (ITTF 2.6.3). Centre line counts as IN.
 
@@ -22,17 +22,18 @@ This project is directly inspired by and based on [clssmitty/PBLineCaller](https
 
 ### 1. Camera Setup
 
-Two phones on the side of the table, landscape, each framing the whole table (wide enough to see faults) but only calling its own quarter. Pick one setting per phone: `SIDE: server half (B1)` or `SIDE: receiver half (B2)`.
+One phone per judged quarter, landscape, on a tripod on the long edge bordering that quarter, each framing the whole table. The two phones end up diagonal to each other (server-right quarter + receiver-right quarter are diagonal).
 
 ```text
-       [ RECEIVER SIDE ]
+        [ RECEIVER SIDE ]
   +------------+------------+
-  |            |            |
+  |      .     |     .      |
   +============+============+  <-- NET
-  |            |            |
+  |      .     |     .      |
   +------------+------------+
-       [ SERVER SIDE ]
-  📷 SIDE (server half, B1)   📷 SIDE (receiver half, B2)
+        [ SERVER SIDE ]
+  📷 judges server-right   📷 judges receiver-right
+  (near end, right edge)   (far end, opposite edge)
 ```
 
 ### 2. Homography & Court Mapping (`TableMapper`)
@@ -49,16 +50,16 @@ Tapping the four corners in table order maps camera pixel space to a fixed 2D to
 * A confirmed-track gate (`BallTracker`) only feeds the serve logic once a blob persists near its predicted position, so single-frame lookalikes can't inject phantom bounces.
 * Sequential trajectory points stored in a `deque` evaluate vertical velocity flips ($\Delta y_1 > 0$ then $\Delta y_2 < 0$) to detect frame-accurate bounce events.
 
-### 4. Serve Adjudication (`ServeCaller`, one combined side setting)
-* **SIDE: server half (B1):** judges the first bounce only (must be `server_right`). Use on the server-half side phone.
-* **SIDE: receiver half (B2):** ignores server-side bounces (bounce 1 belongs to the other phone) and judges the first receiver-side bounce (must be `receiver_right`). Use on the receiver-half side phone.
-* Bounces outside the calibrated table (`off_table`) count as **FAULT** for the phone responsible for that half.
+### 4. Serve Adjudication (`ServeCaller`, single quarter, no modes)
+* At START SERVE the app auto-picks the nearest quarter (largest image area); tap the preview while idle to claim a different one. The pick is shown as `MY QUARTER: <name> (auto|tap)` and drawn thick on the preview.
+* The first bounce seen is judged: inside my quarter (+line pad, centre/net lines count IN) → **IN**, anything else (wrong half or `off_table`) → **FAULT**. Cross-half bounces never enter the quarter-cropped track, so no ignore-other-half logic is needed.
+* Known gap: a fault landing far outside your crop produces no verdict on your phone (nothing to track) — the other phone or the players call those.
 
 ### 5. 30 FPS notes (quarter-ROI, streaks, exposure)
 * Each phone processes only its own quarter (`TableMapper.quarter_poly` + bbox crop, ~1/5 pixels) but keeps the 4-corner homography so net/centre lines stay consistent. Bounce is refined to the between-frame midpoint in table space with a line pad (centre line = IN).
 * Fast serves streak (aspect 2-4): detector has a `round` + `streak` path (`Streak circ >=`, `Streak aspect <=` in TUNING). Streak fill is judged against the enclosing rect, not the enclosing circle.
 * Tracker defaults are 30 FPS-tuned (`Track jump` 180px, `Confirm hits` 1, 2-frame constant-velocity coast). Watch `logcat` `tick avg=..ms` — it must stay under ~33ms to actually process 30 FPS.
-* Exposure: the app best-effort locks AE/AWB, fixes focus, and picks the fastest preview FPS range via pyjnius (see `_lock_exposure`). Short shutter darkens the image, so play under strong hall lighting; if the ball vanishes, lower `White V min` in TUNING.
+* Exposure/focus: the app best-effort locks AE/AWB and picks the fastest preview FPS range via pyjnius (see `_lock_exposure`); focus is locked once at startup (`fixed` → `infinity` → `edof`, falling back to continuous AF only if the device has no locked mode) so bad light can't make it hunt mid-serve. Short shutter darkens the image, so play under strong hall lighting; if the ball vanishes, lower `White V min` in TUNING.
 
 ---
 
