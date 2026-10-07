@@ -32,36 +32,20 @@ import numpy as np
 WARP_W, WARP_H = 300, 560  # warped table size (x=width, y=length)
 
 
-def order_corners(pts):
-    """Order 4 points as TL, TR, BR, BL."""
-    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]
-    bl = pts[np.argmax(d)]
-    return np.array([tl, tr, br, bl], dtype=np.float32)
-
-
 class TableMapper:
     """4-click calibration -> homography to top-down view.
 
-    Preferred: set_corners_quadrant_order() with 4 taps around YOUR OWN
-    quadrant only (no need to frame the whole table):
+    set_corners_quadrant_order() takes 4 taps around YOUR OWN quadrant
+    only (no need to frame the whole table):
       1. near-right outer corner, 2. near-centre (end line + centre line),
       3. far-centre (net + centre), 4. far-right (net + sideline).
     Each phone's own quarter always lands on the warp bottom-right slot
     ("server_right").
-    Legacy: set_corners_table_order() (full-table 4 corners) and
-    set_corners() (auto-ordered) are kept for backwards compatibility.
     """
 
-    def __init__(self, corners_bgr_ordered=None):
+    def __init__(self):
         self.H = None
         self.corners = None
-        if corners_bgr_ordered is not None:
-            self.set_corners(corners_bgr_ordered)
 
     def set_corners_quadrant_order(self, near_right_outer, near_centre,
                                     far_centre, far_right):
@@ -83,34 +67,6 @@ class TableMapper:
         self.corners = src
         self.H = cv2.getPerspectiveTransform(src, dst)
 
-    def set_corners_table_order(self, near_right, near_left,
-                                 far_left, far_right):
-        """Set homography from 4 full-table taps in positional order.
-
-        Args are (x, y) camera pixels, tapped from your own end:
-          near_right: your end, your right -> warp (W, H) (MY quarter)
-          near_left:  your end, your left  -> warp (0, H)
-          far_left:   far end, same edge   -> warp (0, 0)
-          far_right:  far end, same edge   -> warp (W, 0)
-        Kept for backwards compatibility; quadrant-only calibration above
-        is preferred (narrow phones can't frame the whole table).
-        """
-        src = np.array([near_right, near_left,
-                        far_left, far_right], dtype=np.float32)
-        # Clockwise in warp space would be BR, BL, TL, TR; cv2 needs
-        # matching src->dst pairs, order among pairs does not matter.
-        dst = np.array([[WARP_W, WARP_H], [0, WARP_H],
-                        [0, 0], [WARP_W, 0]], dtype=np.float32)
-        self.corners = src
-        self.H = cv2.getPerspectiveTransform(src, dst)
-
-    def set_corners(self, corners):
-        self.corners = order_corners(corners)
-        dst = np.array(
-            [[0, 0], [WARP_W, 0], [WARP_W, WARP_H], [0, WARP_H]], dtype=np.float32
-        )
-        self.H = cv2.getPerspectiveTransform(self.corners, dst)
-
     def to_table(self, x, y):
         """Camera pixel -> warped table coords."""
         p = np.array([[[float(x), float(y)]]], dtype=np.float32)
@@ -121,13 +77,12 @@ class TableMapper:
         tx, ty = self.to_table(x, y)
         return -margin <= tx <= WARP_W + margin and -margin <= ty <= WARP_H + margin
 
-    def quadrant(self, x, y, behind_server=True):
+    def quadrant(self, x, y):
         """Return 'server_right' / 'server_left' / 'receiver_right' / 'receiver_left'.
 
         Names are SLOT-based (see module docstring): 'server_right' always
         means the tap-1 (near-right) quadrant = MY quarter on every phone.
         Geometry: own end is y>H/2, far end y<H/2; right is x>W/2.
-        `behind_server` is kept for backwards compatibility and ignored.
         """
         tx, ty = self.to_table(x, y)
         is_server_side = ty > WARP_H / 2
@@ -137,11 +92,6 @@ class TableMapper:
         else:
             # receiver faces the other way: their right is table-left
             return "receiver_right" if not is_table_right else "receiver_left"
-
-    def side(self, x, y):
-        """Return 'server' if warped y is on the server half, else 'receiver'."""
-        _, ty = self.to_table(x, y)
-        return "server" if ty > WARP_H / 2 else "receiver"
 
     def quarter_warp_quad(self, quadrant):
         """Warp-space rect of one quadrant. Quadrant: 'server_right' |
@@ -197,7 +147,7 @@ def crop_for_poly(frame_shape, poly, margin=40, top_extra=100):
     bbox (incoming ball is ~46 cm/frame above the table at 30 FPS, roughly
     80-120 image px), so the pre-bounce frame stays inside the crop and the
     track can acquire before the bounce.
-    Returns (x0, y0, x1, y1, ox, oy) clipped to the frame.
+    Returns (x0, y0, x1, y1) clipped to the frame.
     """
     h, w = frame_shape[:2]
     p = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
@@ -206,8 +156,8 @@ def crop_for_poly(frame_shape, poly, margin=40, top_extra=100):
     x1 = int(min(float(p[:, 0].max()) + margin, w))
     y1 = int(min(float(p[:, 1].max()) + margin, h))
     if x1 <= x0 + 4 or y1 <= y0 + 4:
-        return 0, 0, w, h, 0, 0
-    return x0, y0, x1, y1, x0, y0
+        return 0, 0, w, h
+    return x0, y0, x1, y1
 
 
 def _resize_small(frame_bgr, width=640):
@@ -254,6 +204,17 @@ def _motion_mask(gray, prev_small, motion_thresh):
     _, mot = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
     mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
     return mot
+
+
+def _ball_mask(hsv, white_v_min, white_s_max):
+    """White + orange HSV mask, median-blurred and morph-opened."""
+    white = cv2.inRange(hsv, np.array([0, 0, int(white_v_min)]),
+                        np.array([180, int(white_s_max), 255]))
+    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
+    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
+    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
+    mask = cv2.medianBlur(mask, 5)
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
 
 def _score_mask_contours(mask, scale, ox, oy, last_pos,
@@ -326,10 +287,7 @@ def _align_roi_for_nv21(x0, y0, x1, y1, w, h):
     y0a = max(int(y0), 0)
     y1a = min(int(y1), h)
     if y1a - y0a >= 2 and (y1a - y0a) % 2 == 1:
-        # shrink by one row to keep height even (prefer keeping y0)
-        if y1a < h:
-            pass  # y1a stays, adjust below by -1
-        y1a -= 1
+        y1a -= 1  # shrink by one row to keep height even (keeps y0)
     if x1a - x0a < 4 or y1a - y0a < 4:
         return None
     return x0a, y0a, x1a, y1a
@@ -363,7 +321,7 @@ def decode_nv21_roi(nv21, w, h, x0, y0, x1, y1):
 def y_gray_small_from_nv21(nv21, w, h, x0, y0, x1, y1, width=640):
     """Downscaled gray ROI straight from the NV21 Y (luma) plane.
 
-    No BGR/HSV decode needed — this feeds the motion-first check (c).
+    No BGR/HSV decode needed — this feeds the motion-first check.
     Uses the same even-aligned bbox as decode_nv21_roi so the scale and
     prev_small shape match the colour ROI path. Returns
     (gray_small, scale, ox, oy) or (None, 1.0, x0, y0) if too small.
@@ -420,8 +378,8 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     if table_poly is not None:
         p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
         if len(p) >= 3:
-            x0, y0, x1, y1, _ox, _oy = crop_for_poly(frame_bgr.shape, p,
-                                                      margin=int(roi_margin))
+            x0, y0, x1, y1 = crop_for_poly(frame_bgr.shape, p,
+                                           margin=int(roi_margin))
             # Even-align the bbox exactly like the NV21 ROI path, so both
             # paths share one scale/prev_small shape and the motion gate
             # stays valid when tick() alternates between them.
@@ -445,8 +403,8 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     mot = _motion_mask(gray, prev_small, int(motion_thresh))
     if (mot is not None and last_pos is None):
         gated = cv2.bitwise_and(mot, roi) if roi is not None else mot
-        # ~0.15% of ROI pixels moving (~150 small-px): ball motion always
-        # exceeds this; sensor noise / AE wobble does not.
+        # 0.15% of ROI pixels moving: ball motion always exceeds this;
+        # sensor noise / AE wobble does not.
         need = max(30, int(0.0015 * h * w))
         if int(cv2.countNonZero(gated)) < need:
             return None, gray
@@ -455,14 +413,7 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     # bbox changed (mot None) -> run full pipeline to acquire.
 
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
-                        np.array([180, white_s_max, 255]))
-    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
-    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
-    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = _ball_mask(hsv, white_v_min, white_s_max)
 
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
@@ -487,11 +438,11 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
                      white_s_max=60):
     """ROI-first NV21 detector: Y-plane motion check before any BGR decode.
 
-    (b)+(c) combined: the ROI gray comes straight from the NV21 luma plane
-    (no full-frame BGR decode). Static frames with no active track return
-    (None, gray) without decoding colour at all; moving frames decode only
-    the ROI bbox to BGR for HSV/contours. Detections are in the same
-    full-res coords as detect_ball_hsv.
+    The ROI gray comes straight from the NV21 luma plane (no full-frame BGR
+    decode). Static frames with no active track return (None, gray) without
+    decoding colour at all; moving frames decode only the ROI bbox to BGR
+    for HSV/contours. Detections are in the same full-res coords as
+    detect_ball_hsv.
 
     nv21: uint8 array shaped (h + h//2, w). Falls back to (None, prev_small)
     if the ROI is degenerate.
@@ -503,8 +454,7 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
     p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
     if len(p) < 3:
         return None, prev_small
-    x0, y0, x1, y1, _ox, _oy = crop_for_poly((h, w), p,
-                                             margin=int(roi_margin))
+    x0, y0, x1, y1 = crop_for_poly((h, w), p, margin=int(roi_margin))
     gray, scale, ox, oy = y_gray_small_from_nv21(nv21, w, h, x0, y0, x1,
                                                  y1, width=640)
     if gray is None:
@@ -537,13 +487,7 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
         roi = _build_roi_mask(sh, sw, poly_local, scale, int(roi_margin))
         mot = None
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
-                        np.array([180, white_s_max, 255]))
-    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
-    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
-    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = _ball_mask(hsv, white_v_min, white_s_max)
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
     if mot is not None:
@@ -560,7 +504,7 @@ def expected_ball_area_range(table_poly, frame_shape):
 
     Uses the quarter polygon size vs real quarter (762.5mm × 1370mm, ball
     40mm) to predict near/far ball diameters in image pixels.  Far is
-    ~0.55× near due to perspective foreshortening at typical phone height.
+    ~0.70× near due to perspective foreshortening at typical phone height.
     Returns (min_far_area, max_near_area) or (60, 600) fallback if geometry
     is degenerate.
     """
@@ -587,7 +531,7 @@ def expected_ball_area_range(table_poly, frame_shape):
         dia_far = float(np.clip(dia_far, 7.0, 28.0))
         area_far = np.pi * (dia_far / 2.0) ** 2
         area_near = np.pi * (dia_near / 2.0) ** 2
-        # widen by ±30% to tolerate focus/lighting
+        # widen to 0.7×–1.4× to tolerate focus/lighting
         return float(area_far * 0.7), float(area_near * 1.4)
     except Exception:
         return 60.0, 600.0
@@ -629,20 +573,19 @@ def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
     """Return per-contour diagnostics for the current HSV mask (no motion).
 
     Used by the on-screen Tuning Assist overlay.  Each entry is a dict with
-    area_full, circularity, solidity, fill, nvert, aspect, passed_ball gate.
-    Areas are normalised to full-res px (same convention as detector sliders).
+    area (full-res px²), circularity, solidity, fill, nvert, aspect, plus
+    the full-res centroid (cx, cy) and radius (r).
     """
     if frame_bgr is None or table_poly is None:
         return [], None
     try:
         h, w = frame_bgr.shape[:2]
         p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
-        x0, y0, x1, y1, ox, oy = crop_for_poly((h, w), p, margin=int(roi_margin))
-        fh, fw = h, w
-        a = _align_roi_for_nv21(x0, y0, x1, y1, fw, fh)
+        x0, y0, x1, y1 = crop_for_poly((h, w), p, margin=int(roi_margin))
+        a = _align_roi_for_nv21(x0, y0, x1, y1, w, h)
         if a is not None:
             x0, y0, x1, y1 = a
-            ox, oy = x0, y0
+        ox, oy = x0, y0
         crop = frame_bgr[y0:y1, x0:x1]
         if crop.size == 0:
             return [], None
@@ -651,13 +594,7 @@ def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
         sh, sw = small.shape[:2]
         roi = _build_roi_mask(sh, sw, poly_local, scale, int(roi_margin))
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        white = cv2.inRange(hsv, np.array([0, 0, int(white_v_min)]),
-                            np.array([180, int(white_s_max), 255]))
-        orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
-        orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
-        mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
-        mask = cv2.medianBlur(mask, 5)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = _ball_mask(hsv, white_v_min, white_s_max)
         if roi is not None:
             mask = cv2.bitwise_and(mask, roi)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
@@ -686,8 +623,7 @@ def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
             fx, fy = cx / scale + ox, cy / scale + oy
             out.append(dict(area=area_full, circ=circularity,
                             solidity=solidity, fill=fill, nvert=nvert,
-                            aspect=aspect, cx=fx, cy=fy, r=r / scale,
-                            cnt=c, scale=scale, ox=ox, oy=oy))
+                            aspect=aspect, cx=fx, cy=fy, r=r / scale))
         # largest first so assist overlay labels the big false positives
         out.sort(key=lambda d: d["area"], reverse=True)
         return out, mask
@@ -695,89 +631,111 @@ def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
         return [], None
 
 
-def suggest_auto_params(frames_bgr, table_poly, frame_shape,
-                        base_params=None, table_mapper=None):
-    """One-shot auto-tune from a short burst of empty-table frames.
+class AutoTuneCollector:
+    """Incremental empty-table analysis for AUTO TUNE.
 
-    `frames_bgr` — list of BGR frames (empty table, no ball, camera static).
-    Analyses motion floor, table HSV, and spurious white blobs to suggest
-    min_area / motion_thresh / white_v_min / white_s_max / roi_margin.
-    Returns (suggested_dict, report_str).  Suggested dict contains only keys
-    that the analysis is confident about; caller may merge into live params.
-
-    Heuristics are conservative: they never propose a min_area below the
-    geometry-predicted far-ball area, and white thresholds are clamped to
-    avoid losing a white or orange ball under dim light.
+    Each frame is reduced to statistics as it arrives (HSV, motion floor,
+    spurious white blobs), so the full burst of BGR frames never has to be
+    stored. `frames` counts accepted samples; `suggest()` returns
+    (suggested_dict, report_str) with conservative heuristics: never a
+    min_area below the geometry-predicted far-ball area, and white
+    thresholds clamped so a dim-light ball is not lost.
     """
-    if not frames_bgr:
-        return {}, "No frames for auto-tune."
-    if base_params is None:
-        base_params = {}
-    try:
-        # --- geometry-predicted ball area ---
-        far_area, near_area = expected_ball_area_range(table_poly, frame_shape)
-        # --- HSV stats (from median frame to be robust to one outlier) ---
-        hsv_stats = None
-        mid = frames_bgr[len(frames_bgr) // 2]
-        if mid is not None:
-            hsv_stats = _hsv_stats_inside_roi(mid, table_poly, erode_px=6)
-        # --- motion floor: inter-frame diff inside ROI ---
-        motion_floor = None
-        small_grays = []
-        for f in frames_bgr:
-            if f is None or table_poly is None:
-                continue
-            try:
-                h, w = f.shape[:2]
-                p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
-                x0, y0, x1, y1, ox, oy = crop_for_poly((h, w), p,
-                                                      margin=int(base_params.get("roi_margin", 40)))
-                fh, fw = h, w
-                a = _align_roi_for_nv21(x0, y0, x1, y1, fw, fh)
-                if a is not None:
-                    x0, y0, x1, y1 = a
-                y_roi = f[y0:y1, x0:x1]
-                if y_roi.size == 0:
-                    continue
-                if y_roi.ndim == 3:
-                    y_roi_gray = cv2.cvtColor(y_roi, cv2.COLOR_BGR2GRAY)
-                else:
-                    y_roi_gray = y_roi
-                g_small, _sc = _resize_small(y_roi_gray)
-                if g_small.ndim == 3:
-                    g_small = cv2.cvtColor(g_small, cv2.COLOR_BGR2GRAY)
-                small_grays.append(g_small)
-            except Exception:
-                continue
-        if len(small_grays) >= 2:
-            diffs = []
-            for i in range(1, len(small_grays)):
-                a, b = small_grays[i - 1], small_grays[i]
-                if a.shape != b.shape:
-                    continue
-                d = cv2.absdiff(a, b)
-                # median diff inside motion — 95th percentile is more
-                # revealing for AE wobble; median may be near zero
-                diffs.append(float(np.percentile(d, 97)))
-                diffs.append(float(np.median(d.astype(np.float32))))
-            if diffs:
-                motion_floor = float(np.median(np.array(diffs)))
-        # --- max noise blob area on empty table ---
-        max_noise = 0.0
-        noise_areas = []
-        for f in frames_bgr:
+
+    def __init__(self, table_poly, base_params=None):
+        self.table_poly = table_poly
+        self.base_params = dict(base_params or {})
+        self.frames = 0
+        self.frame_shape = None
+        self._far_area = 60.0
+        self._near_area = 600.0
+        self._prev_gray = None
+        self._diffs = []
+        self._hsv_stats = []
+        self._noise_areas = []
+        self._max_noise = 0.0
+
+    def add(self, frame_bgr):
+        """Feed one empty-table frame; per-frame analysis is best-effort."""
+        if frame_bgr is None or self.table_poly is None:
+            return
+        if self.frame_shape is None:
+            self.frame_shape = frame_bgr.shape
+            self._far_area, self._near_area = expected_ball_area_range(
+                self.table_poly, self.frame_shape)
+        self._add_motion(frame_bgr)
+        self._add_hsv(frame_bgr)
+        self._add_noise(frame_bgr)
+        self.frames += 1
+
+    def _roi(self, frame_bgr):
+        h, w = frame_bgr.shape[:2]
+        p = np.asarray(self.table_poly, dtype=np.float32).reshape(-1, 2)
+        x0, y0, x1, y1 = crop_for_poly(
+            (h, w), p, margin=int(self.base_params.get("roi_margin", 40)))
+        a = _align_roi_for_nv21(x0, y0, x1, y1, w, h)
+        if a is not None:
+            x0, y0, x1, y1 = a
+        return frame_bgr[y0:y1, x0:x1]
+
+    def _add_motion(self, frame_bgr):
+        try:
+            y_roi = self._roi(frame_bgr)
+            if y_roi.size == 0:
+                return
+            if y_roi.ndim == 3:
+                y_roi = cv2.cvtColor(y_roi, cv2.COLOR_BGR2GRAY)
+            g_small, _sc = _resize_small(y_roi)
+            if g_small.ndim == 3:
+                g_small = cv2.cvtColor(g_small, cv2.COLOR_BGR2GRAY)
+            if self._prev_gray is not None and self._prev_gray.shape == g_small.shape:
+                d = cv2.absdiff(g_small, self._prev_gray)
+                # p97 catches AE wobble / edge noise; the median keeps the
+                # static floor in the sample.
+                self._diffs.append(float(np.percentile(d, 97)))
+                self._diffs.append(float(np.median(d.astype(np.float32))))
+            self._prev_gray = g_small
+        except Exception:
+            pass
+
+    def _add_hsv(self, frame_bgr):
+        try:
+            stats = _hsv_stats_inside_roi(frame_bgr, self.table_poly, erode_px=6)
+            if stats is not None:
+                self._hsv_stats.append(stats)
+        except Exception:
+            pass
+
+    def _add_noise(self, frame_bgr):
+        try:
             diags, _ = debug_contours_for_frame(
-                f, table_poly,
-                roi_margin=int(base_params.get("roi_margin", 40)),
-                white_v_min=int(base_params.get("white_v_min", 150)),
-                white_s_max=int(base_params.get("white_s_max", 60)))
+                frame_bgr, self.table_poly,
+                roi_margin=int(self.base_params.get("roi_margin", 40)),
+                white_v_min=int(self.base_params.get("white_v_min", 150)),
+                white_s_max=int(self.base_params.get("white_s_max", 60)))
             for d in diags:
-                # consider blobs up to near_area*1.2 as potential noise
-                # (larger blobs are likely shirts/walls outside ROI and
-                #  are already masked; huge blobs are ignored)
-                if d["area"] <= max(near_area * 1.8, 1200):
-                    noise_areas.append(d["area"])
-                    max_noise = max(max_noise, d["area"])
+                # blobs up to near_area*1.8 are potential noise (larger
+                # blobs are likely shirts/walls outside the ROI)
+                if d["area"] <= max(self._near_area * 1.8, 1200):
+                    self._noise_areas.append(d["area"])
+                    self._max_noise = max(self._max_noise, d["area"])
+        except Exception:
+            pass
+
+    def suggest(self):
+        """Merge accumulated stats into (suggested_dict, report_str)."""
+        if self.frames == 0 or self.frame_shape is None:
+            return {}, "No frames for auto-tune."
+        far_area, near_area = self._far_area, self._near_area
+        # median of the per-frame stats is robust to one outlier frame
+        hsv_stats = None
+        if self._hsv_stats:
+            hsv_stats = dict(
+                v_mean=float(np.median([s["v_mean"] for s in self._hsv_stats])),
+                v_p95=float(np.median([s["v_p95"] for s in self._hsv_stats])),
+                s_median=float(np.median([s["s_median"] for s in self._hsv_stats])))
+        motion_floor = float(np.median(self._diffs)) if self._diffs else None
+        noise_areas, max_noise = self._noise_areas, self._max_noise
         # p90 noise area is more robust than single max (one glint)
         p90_noise = float(np.percentile(noise_areas, 90)) if noise_areas else max_noise
 
@@ -797,7 +755,7 @@ def suggest_auto_params(frames_bgr, table_poly, frame_shape,
             # snap to slider step 20
             cand = int(round(cand / 20.0) * 20)
             suggested["min_area"] = int(cand)
-            lines.append(f"min_area {base_params.get('min_area','?')} -> {cand} "
+            lines.append(f"min_area {self.base_params.get('min_area','?')} -> {cand} "
                          f"(noise p90 {p90_noise:.0f} max {max_noise:.0f}, "
                          f"exp far {far_area:.0f} near {near_area:.0f})")
         else:
@@ -823,11 +781,9 @@ def suggest_auto_params(frames_bgr, table_poly, frame_shape,
             v_mean = hsv_stats["v_mean"]
             # table blue V ~ 110-180 indoor; white ball ~ 210-255
             cand_v = int(round(np.clip(v_p95 + 18, 125, 210)))
-            # in very bright halls p95 already ~200 -> push to 210 max
-            # in dim halls p95 ~120 -> cand ~138, but floor at 135 keeps ball
+            # very bright halls p95 ~200 -> 210 max; dim halls p95 ~120 ->
+            # cand ~138, but the 135 floor keeps a dim-light ball visible
             cand_v = max(cand_v, 135)
-            # if user was at 150 and we propose 138, don't darken too much
-            # unless noise indicates it — keep at least base-10
             suggested["white_v_min"] = cand_v
             lines.append(f"white_v_min -> {cand_v} (table V mean {v_mean:.0f} p95 {v_p95:.0f})")
             # white_s_max: table blue is saturated (~140), white is <50.
@@ -845,12 +801,12 @@ def suggest_auto_params(frames_bgr, table_poly, frame_shape,
         # drags in floor/wall false positives (concrete, legs).  If the
         # quarter polygon already touches the frame edge, shrink margin.
         try:
-            h, w = frame_shape[:2]
-            p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+            h, w = self.frame_shape[:2]
+            p = np.asarray(self.table_poly, dtype=np.float32).reshape(-1, 2)
             bbox_w = float(p[:, 0].max() - p[:, 0].min())
             # if quarter occupies >45% of frame width, margin is risky
             frac = bbox_w / max(w, 1)
-            if frac > 0.48 and int(base_params.get("roi_margin", 40)) > 30:
+            if frac > 0.48 and int(self.base_params.get("roi_margin", 40)) > 30:
                 suggested["roi_margin"] = 28
                 lines.append(f"roi_margin  -> 28 (quarter {frac*100:.0f}% of frame, tight crop)")
         except Exception:
@@ -861,8 +817,6 @@ def suggest_auto_params(frames_bgr, table_poly, frame_shape,
         if noise_areas:
             report += f"  Empty-table noise up to {max_noise:.0f} px."
         return suggested, report
-    except Exception as e:
-        return {}, f"Auto-tune failed: {e}"
 
 
 def is_bounce(traj, min_drop=3.0, min_rise=3.0):
@@ -890,7 +844,7 @@ class BallTracker:
     bounce detection.
 
     30 FPS retune: a 50 km/h serve jumps ~46 cm/frame (~150 image px), so
-    the default max_jump is 150 (not 80) and confirm_streak defaults to 1
+    max_jump defaults to 180 and confirm_streak defaults to 1
     (a serve is only 3-5 frames; requiring 2 kills fast tracks when the
     quarter-ROI + motion gate already cut false positives). Up to
     coast_frames missed frames are bridged with constant-velocity
@@ -974,7 +928,7 @@ class BallTracker:
             self._cand = (x, y)
             self._cand_streak = 1
         if self._cand_streak >= self.confirm_streak:
-            if self._cand is not None and self._cand_streak > 1:
+            if self._cand_streak > 1:
                 self._vel = (x - self._cand[0], y - self._cand[1])
             self.pos = (x, y)
             self._real = (x, y)
@@ -998,12 +952,10 @@ class ServeCaller:
                  "receiver_right", "receiver_left")
 
     def __init__(self, table: TableMapper, want="server_right",
-                 behind_server=True, min_drop=3.0, min_rise=3.0,
-                 line_pad=10.0):
+                 min_drop=3.0, min_rise=3.0, line_pad=10.0):
         if want not in self.QUADRANTS:
             raise ValueError(f"want must be one of {self.QUADRANTS}, got {want!r}")
         self.table = table
-        self.behind_server = behind_server  # legacy, unused (orientation is in taps)
         self.want = want
         self.min_drop = float(min_drop)
         self.min_rise = float(min_rise)
@@ -1074,9 +1026,6 @@ class ServeCaller:
         return self.verdict
 
     def _judge(self):
-        self._judge_single(self.want)
-
-    def _judge_single(self, want):
         # IN-only: inside my quad (+line pad) -> IN, else stay silent and
         # keep watching. Outside/off-table bounces never decide.
         mx, my, _q = self.bounces[-1]

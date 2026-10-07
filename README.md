@@ -21,7 +21,7 @@ Tap CALIBRATE, then your quadrant corners in order from your end: 1. near-right 
 
 ## Tuning
 
-* **ASSIST:** overlay of white-mask candidates (yellow, with area/circularity labels) plus a stats bar (`cands`, largest noise blob, expected ball range computed from your calibration, `min_area`). On an empty table every blob shown is a would-be false positive — raise `Min area` or tighten `White V min` / `White S max` until they disappear.
-* **MASK:** small inset of the HSV white mask, to see if glare is leaking through.
-* **TABLE PRESET:** one tap for a blue-table/concrete-hall view (`min_area 200, max_area 3200, roi_margin 30, motion_thresh 28, white_v_min 165, white_s_max 55`).
-* **AUTO TUNE:** after calibrating, point at the empty table and tap it; hold still for the ~45-frame burst. Suggests `min_area` / `motion_thresh` / white gates from table noise and applies them (full report in `logcat`). Re-tap when lighting changes.
+* **TABLE PRESET:** tap once if you're on a blue table in a bright/concrete hall; otherwise skip it. It's the starting point, not a final tune.
+* **AUTO TUNE:** table empty and phone still, tap it, wait for the "done" status (~1.5 s). Re-run whenever lighting changes (day/night, lights on/off).
+* **ASSIST:** verify: on an empty table you should see zero yellow circles (or only tiny ones). If not, open TUNING and raise Min area / White V min, lower White S max until they disappear. During a serve the tracked ball shows as a red circle. Turn ASSIST off for match play.
+* **MASK:** only needed if white false positives persist; the top-right inset shows what the detector sees. If it's mostly white (glare, floor, wall), tighten the white gates. It auto-enables ASSIST, so turn both off when done.

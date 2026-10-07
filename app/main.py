@@ -18,6 +18,7 @@ Flow:
 import cv2
 import numpy as np
 import threading
+import time
 from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.graphics.texture import Texture
@@ -33,7 +34,7 @@ from kivy.metrics import dp
 
 from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
                             detect_ball_nv21, BallTracker,
-                            debug_contours_for_frame, suggest_auto_params,
+                            debug_contours_for_frame, AutoTuneCollector,
                             expected_ball_area_range)
 
 from plyer import tts
@@ -140,6 +141,7 @@ class ServeApp(App):
         self.params = dict(TUNE_DEFAULTS)
         self.tracker = BallTracker(max_jump=self.params["max_jump"],
                                    confirm_streak=int(self.params["confirm_streak"]))
+        self.frame = None
         self._prev_small = None
         self._tex = None
         self._said = False
@@ -149,12 +151,6 @@ class ServeApp(App):
         self._tick_ms_ema = 0.0
         self._render_every = 2
         self._exposure_locked = False
-        self._tts_thread = None
-        # Focus: always locked (fixed/infinity first) — no hunting mid-serve.
-        # Continuous AF was tried but hunted in bad hall light; a frozen
-        # focus plane tests better once the table is framed. Applied once
-        # via pyjnius; falls back to continuous AF if the device has no
-        # fixed/infinity/edof mode.
         self.tuning_open = False
         self._tune_sliders = {}
         self._tune_values = {}
@@ -162,8 +158,7 @@ class ServeApp(App):
         # Tuning Assist / Auto-Tune state
         self.assist_mode = False
         self.assist_mask_preview = False
-        self._assist_stats = ""
-        self._auto_frames = None  # list[BGR] while collecting
+        self._auto_tune = None  # AutoTuneCollector while collecting
         self._auto_needed = 0
 
         root = BoxLayout(orientation="vertical")
@@ -295,11 +290,14 @@ class ServeApp(App):
             self.status.text = "Assist ON: yellow=candidates, red=tracked. Tune sliders live."
         else:
             self.status.text = "Assist OFF."
-            self._assist_stats = ""
 
     def toggle_mask_preview(self, *_):
         self.assist_mask_preview = not self.assist_mask_preview
         self._mask_btn.text = "MASK ON" if self.assist_mask_preview else "MASK OFF"
+        # The inset is drawn by the assist overlay, so it needs ASSIST on.
+        if self.assist_mask_preview and not self.assist_mode:
+            self.assist_mode = True
+            self.assist_btn.text = "ASSIST ON"
         self.status.text = "Mask preview ON (HSV white mask)" if self.assist_mask_preview else "Mask preview OFF"
 
     def apply_table_preset(self, *_):
@@ -311,8 +309,8 @@ class ServeApp(App):
                 self._tune_values[key].text = fmt.format(self.params[key])
         self._apply_live_settings()
         far_a, near_a = expected_ball_area_range(
-            self.table.quarter_poly("server_right") if self.table.H is not None else None,
-            getattr(self, "frame", np.zeros((720, 1280, 3), dtype=np.uint8)).shape)
+            self.table.quarter_poly("server_right"),
+            self.frame.shape if self.frame is not None else (720, 1280, 3))
         self.status.text = (f"Table preset applied (min_area {RECOMMENDED_TABLE_PRESET['min_area']}, "
                             f"white V {RECOMMENDED_TABLE_PRESET['white_v_min']}). "
                             f"Exp ball {far_a:.0f}-{near_a:.0f}px. Fine-tune or AUTO TUNE next.")
@@ -322,31 +320,28 @@ class ServeApp(App):
         if self.table.H is None:
             self.status.text = "Calibrate first (4 corners), then AUTO TUNE on empty table."
             return
-        if self._auto_frames is not None:
+        if self._auto_tune is not None:
             self.status.text = "Auto-tune already running..."
             return
-        # Keep current frame as reference, collect ~45 frames (~1.5s)
-        # Caller must keep the table empty and the phone still.
-        self._auto_frames = []
+        # Caller must keep the table empty and the phone still while
+        # ~45 frames (~1.5s) are collected.
+        self._auto_tune = AutoTuneCollector(
+            self.table.quarter_poly("server_right"),
+            base_params=dict(self.params))
         self._auto_needed = 45
         self.status.text = "AUTO TUNE: keep table EMPTY & still for 2s... (collecting)"
         Logger.info("PPLineCaller: auto-tune start, collecting 45 frames")
 
     def _finish_auto_tune(self):
-        frames = self._auto_frames or []
-        self._auto_frames = None
+        collector = self._auto_tune
+        self._auto_tune = None
         self._auto_needed = 0
-        if len(frames) < 5:
+        if collector is None or collector.frames < 5:
             self.status.text = "Auto-tune: not enough frames (camera not ready)."
             return
         try:
-            qpoly = self.table.quarter_poly("server_right")
-            shape = frames[0].shape
-            suggested, report = suggest_auto_params(
-                frames, qpoly, shape,
-                base_params=dict(self.params),
-                table_mapper=self.table)
-            Logger.info(f"PPLineCaller: auto-tune report:\n{report}\nframes={len(frames)}")
+            suggested, report = collector.suggest()
+            Logger.info(f"PPLineCaller: auto-tune report:\n{report}\nframes={collector.frames}")
             # Apply suggested keys live and move sliders so user sees them
             for k, v in suggested.items():
                 self.params[k] = v
@@ -357,7 +352,7 @@ class ServeApp(App):
             self._apply_live_settings()
             # Show concise status + keep full report in logcat
             changes = ", ".join(f"{k}={v}" for k, v in suggested.items())
-            self.status.text = f"Auto-tune done ({len(frames)} fr): {changes}. Check logcat for details. Turn ASSIST ON to verify."
+            self.status.text = f"Auto-tune done ({collector.frames} fr): {changes}. Check logcat for details. Turn ASSIST ON to verify."
             # Auto-enable assist so user can immediately see the effect
             if not self.assist_mode:
                 self.assist_mode = True
@@ -381,15 +376,6 @@ class ServeApp(App):
             for i, d in enumerate(diags[:10]):
                 cx, cy = int(d["cx"]), int(d["cy"])
                 r = int(max(d["r"], 3))
-                # contour outline in yellow
-                cnt = d["cnt"]
-                # map small contour back to full-res for drawing
-                # cnt is in small space; rebuild full-res points
-                sc = d["scale"]; ox = d["ox"]; oy = d["oy"]
-                pts = (d["cnt"].astype(np.float32) / sc)
-                # pts are still in small crop coords; need offset
-                # _resize_small lost origin; instead draw circle + area text
-                # (accurate polygon would need roi transform) — circle is enough
                 is_pass = (d["area"] >= p["min_area"] and d["area"] <= p["max_area"]
                            and d["circ"] >= 0.30)  # rough
                 col = (0, 255, 255) if not is_pass else (0, 165, 255)  # yellow vs orange
@@ -399,7 +385,7 @@ class ServeApp(App):
                     label = f"{d['area']:.0f} c{d['circ']:.2f}"
                     cv2.putText(frame, label, (cx + r + 2, cy),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1)
-            # stats bar at bottom (avoid top-left where MY used to be)
+            # stats bar at bottom
             n = len(diags)
             far_a, near_a = expected_ball_area_range(qpoly, frame.shape)
             max_a = max((d["area"] for d in diags), default=0)
@@ -409,22 +395,17 @@ class ServeApp(App):
             else:
                 motion_txt = "no white blobs"
             stats = f"ASSIST cands={n} {motion_txt} | exp ball {far_a:.0f}-{near_a:.0f} | min_area {p['min_area']:.0f}"
-            self._assist_stats = stats
-            # draw semi-transparent bar
             cv2.rectangle(frame, (0, frame.shape[0] - 22), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
             cv2.putText(frame, stats, (6, frame.shape[0] - 7),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
-            # optionally composite mask as inset if requested
             if self.assist_mask_preview and mask is not None:
                 try:
-                    # mask is small; resize to 1/4 preview inset
                     mh, mw = mask.shape[:2]
                     inset_w = min(320, frame.shape[1] // 3)
                     inset_h = int(inset_w * mh / max(mw, 1))
                     small_mask = cv2.resize(mask, (inset_w, inset_h))
-                    # convert to BGR for overlay
                     inset = cv2.cvtColor(small_mask, cv2.COLOR_GRAY2BGR)
-                    # place at top-right with border
+                    # top-right with border
                     x1 = frame.shape[1] - inset_w - 6
                     y1 = 6
                     x2, y2 = x1 + inset_w, y1 + inset_h
@@ -465,7 +446,7 @@ class ServeApp(App):
         return u * w, (1.0 - v) * h  # frame row 0 is the top
 
     def on_preview_tap(self, img, touch):
-        if getattr(self, "frame", None) is None:
+        if self.frame is None:
             return False
         if not img.collide_point(touch.x, touch.y):
             return False
@@ -548,7 +529,7 @@ class ServeApp(App):
             ok, msg = self._ensure_focus()
             Logger.info(f"PPLineCaller: initial focus: {msg}")
             # Warm the TTS engine now (background thread) so the first
-            # verdict's "In"/"Fault" doesn't pay the 1-3s init cost.
+            # verdict doesn't pay the 1-3s init cost.
             self.say("Ready")
         except Exception as e:
             self.status.text = f"Camera error: {e}"
@@ -556,23 +537,14 @@ class ServeApp(App):
     def _lock_exposure(self):
         """Brightness-safe preview stabilization (delayed, best-effort).
 
-        Why the old version made the room black: it ran immediately after
-        start() (AE not yet converged) + setAutoExposureLock(True) froze
-        that dark boot frame + EC=-1 darkened it further + forcing a fixed
-        [30000,30000] FPS range forbade the driver from dropping to 15 FPS
-        to gather light in a dim hall.
-
-        New behaviour (safe default):
-          * NEVER locks AE / AWB — Android keeps managing brightness.
-          * Resets exposure compensation to 0 (was -1).
-          * Requests a FLEXIBLE FPS range: among ranges with the highest
-            max (usually 30000 = 30fps) pick the one with the LOWEST min
-            (e.g. [15000,30000] over [30000,30000]) so bright light still
-            gets 30 FPS but dim light may drop FPS to stay bright.
-            If no flexible range exists, FPS is left untouched.
-        (Focus is handled separately in _ensure_focus.) Any failure only
-        logs. If the image is still too dark, leave this disabled entirely
-        (Option A: don't schedule it) and lower white_v_min via TUNING.
+        Never locks AE/AWB: locking before AE converges froze a dark boot
+        frame. Resets exposure compensation to 0 and requests a FLEXIBLE
+        FPS range: among ranges with the highest max (usually 30000 = 30
+        fps) pick the one with the LOWEST min (e.g. [15000,30000] over
+        [30000,30000]) so dim light may drop FPS to stay bright while
+        bright light still gets 30 FPS. FPS is left untouched if no
+        flexible range exists. Any failure only logs; focus is handled
+        separately in _ensure_focus.
         """
         if self._exposure_locked:
             return
@@ -583,13 +555,9 @@ class ServeApp(App):
                 return
             params = cam.getParameters()
             info = []
-            # Intentionally no setAutoExposureLock(True) /
-            # setAutoWhiteBalanceLock(True): locking freezes brightness
-            # and causes the black-room symptom.
             try:
                 lo, hi = params.getMinExposureCompensation(), params.getMaxExposureCompensation()
-                # neutral exposure: was -1 (darkens ~1/3-1/2 stop).
-                target = max(lo, min(hi, 0))
+                target = max(lo, min(hi, 0))  # neutral exposure
                 params.setExposureCompensation(target)
                 info.append(f"ec={target}[{lo},{hi}]")
             except Exception as e:
@@ -632,7 +600,7 @@ class ServeApp(App):
         for one-shot auto) on devices with no locked mode. Safe no-op when
         camera isn't ready.
         """
-        if getattr(self, "cam", None) is None:
+        if self.cam is None:
             return False, "camera not ready"
         cam = getattr(self.cam, "_android_camera", None)
         if cam is None:
@@ -691,9 +659,9 @@ class ServeApp(App):
     def _grab_nv21(self):
         """Grab one preview buffer as (buf, w, h, nv21) without decoding.
 
-        Splits the old _read_frame into grab vs decode so tick() can run
-        the ROI-first path (b): Y-plane motion check + ROI-only BGR decode,
-        decoding the full frame only when an upload/render is due.
+        Grab and decode are split so tick() can run the ROI-first path:
+        Y-plane motion check + ROI-only BGR decode, decoding the full
+        frame only when an upload/render is due.
         """
         if self.cam is None:
             return None
@@ -732,13 +700,6 @@ class ServeApp(App):
                 self.status.text = f"Frame decode error: {e}"
             return None
 
-    def _read_frame(self):
-        raw = self._grab_nv21()
-        if raw is None:
-            return None
-        _buf, w, h, nv21 = raw
-        return self._decode_full_nv21(nv21, w, h, _buf)
-
     def say(self, text):
         """Speak without blocking the 30Hz tick: tts.speak() on Android can
         take 1-3s (engine init + utterance), which used to stall the whole
@@ -748,13 +709,10 @@ class ServeApp(App):
                 tts.speak(text)
             except Exception:
                 pass
-        t = threading.Thread(target=_speak, daemon=True)
-        self._tts_thread = t
-        t.start()
+        threading.Thread(target=_speak, daemon=True).start()
 
     def _draw_calib_points(self, frame):
         """Draw each tapped corner (numbered) plus joining lines."""
-        import numpy as np
         pts = [(int(x), int(y)) for x, y in self.calib_pts]
         if len(pts) >= 2:
             cv2.polylines(frame, [np.array(pts, dtype=np.int32)], False,
@@ -766,7 +724,6 @@ class ServeApp(App):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
     def tick(self, _dt):
-        import time
         t0 = time.perf_counter()
         raw = self._grab_nv21()
         if raw is None:
@@ -774,12 +731,12 @@ class ServeApp(App):
         _buf, w, h, nv21 = raw
         self._tick_count += 1
         # -- auto-tune collection (empty-table burst) -------------------
-        if self._auto_frames is not None:
+        if self._auto_tune is not None:
             frame_at = self._decode_full_nv21(nv21, w, h, _buf)
             if frame_at is not None:
                 self.frame = frame_at
-                self._auto_frames.append(frame_at.copy())
-                n = len(self._auto_frames)
+                self._auto_tune.add(frame_at)
+                n = self._auto_tune.frames
                 self.status.text = f"AUTO TUNE: keep still... {n}/{self._auto_needed} frames"
                 # small progress bar
                 try:
@@ -789,7 +746,7 @@ class ServeApp(App):
                 except Exception:
                     pass
                 # keep minimal overlay so user sees live view
-                qp = self.table.quarter_poly("server_right") if self.table.H is not None else None
+                qp = self.table.quarter_poly("server_right")
                 if qp is not None:
                     cv2.polylines(frame_at, [qp.astype(int)], True, (0, 255, 0), 3)
                 self._upload(frame_at)
@@ -812,9 +769,9 @@ class ServeApp(App):
             self._upload(frame)
         else:
             p = self.params
-            # ROI-first (b): Y-plane motion check + ROI-only BGR decode.
+            # ROI-first: Y-plane motion check + ROI-only BGR decode.
             # Full-frame BGR is decoded only when an upload/render is due;
-            # static ROI-only frames skip colour decode + HSV entirely (c).
+            # static ROI-only frames skip colour decode + HSV entirely.
             # self.frame keeps the last full frame for tap mapping/overlays
             # (resolution is fixed, so stale shape still maps correctly).
             qpoly = self.table.quarter_poly("server_right")
@@ -851,7 +808,7 @@ class ServeApp(App):
             if curr_small is not None:
                 self._prev_small = curr_small
             pos = self.tracker.update((det[0], det[1]) if det else None)
-            # coasted predictions reuse last radius for drawing
+            # no detection (coasting): fall back to a small radius
             r_draw = int(det[2]) if det else 6
             verdict = self.caller.update(pos)
             if verdict == "IN":
@@ -880,7 +837,7 @@ class ServeApp(App):
                 if pos is not None:
                     x, y = (int(pos[0]), int(pos[1]))
                     cv2.circle(frame, (x, y), max(r_draw, 4), (0, 0, 255), 2)
-                # draw MY quadrant (thick outline only — MY label removed)
+                # draw my quadrant (thick outline)
                 if qpoly is not None:
                     cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
                 for i, (bx, by, q) in enumerate(self.caller.bounces):
@@ -899,7 +856,7 @@ class ServeApp(App):
         if self._tick_count % 60 == 0:
             Logger.info(f"PPLineCaller: tick avg={self._tick_ms_ema:.1f}ms "
                         f"last={ms:.1f}ms n={self._tick_count} "
-                        f"bounces={len(getattr(self.caller, 'bounces', []))}")
+                        f"bounces={len(self.caller.bounces)}")
 
     def _upload(self, frame):
         # Upload as RGB: GLES has no BGR texture format, and reuse one texture
