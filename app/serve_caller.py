@@ -555,6 +555,316 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
     return best, gray
 
 
+def expected_ball_area_range(table_poly, frame_shape):
+    """Estimate ball area range (full-res px^2) from table geometry.
+
+    Uses the quarter polygon size vs real quarter (762.5mm × 1370mm, ball
+    40mm) to predict near/far ball diameters in image pixels.  Far is
+    ~0.55× near due to perspective foreshortening at typical phone height.
+    Returns (min_far_area, max_near_area) or (60, 600) fallback if geometry
+    is degenerate.
+    """
+    try:
+        h, w = frame_shape[:2]
+        p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+        if len(p) < 3:
+            return 60.0, 600.0
+        # bbox of quarter polygon — approximates quarter width/height in px
+        qw = float(p[:, 0].max() - p[:, 0].min())
+        qh = float(p[:, 1].max() - p[:, 1].min())
+        if qw < 20 or qh < 20:
+            return 60.0, 600.0
+        # real quarter width 762.5mm, ball 40mm => 5.25% of quarter width
+        ratio = 40.0 / 762.5
+        # use width as primary scale; clamp to reasonable 60–90% of bbox
+        # (perspective makes the far edge narrower, so average width is okay)
+        dia_near = qw * ratio
+        # empirical correction: observed bbox includes top_extra, so scale a bit
+        dia_near = float(np.clip(dia_near, 8.0, 40.0))
+        # quarter spans near baseline to net (≈½ table length); perspective
+        # 0.70 matches the ~30% foreshortening seen in the reference Sponeta view
+        dia_far = dia_near * 0.70
+        dia_far = float(np.clip(dia_far, 7.0, 28.0))
+        area_far = np.pi * (dia_far / 2.0) ** 2
+        area_near = np.pi * (dia_near / 2.0) ** 2
+        # widen by ±30% to tolerate focus/lighting
+        return float(area_far * 0.7), float(area_near * 1.4)
+    except Exception:
+        return 60.0, 600.0
+
+
+def _hsv_stats_inside_roi(frame_bgr, poly, erode_px=8):
+    """HSV stats sampled strictly inside the quarter polygon.
+
+    Returns dict with v_mean, v_std, v_p95, s_mean, s_median or None if
+    degenerate.
+    """
+    try:
+        h, w = frame_bgr.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2).astype(np.int32)
+        cv2.fillPoly(mask, [pts], 255)
+        if erode_px > 0:
+            k = max(erode_px, 1)
+            mask = cv2.erode(mask, np.ones((k, k), np.uint8))
+        if int(cv2.countNonZero(mask)) < 500:
+            return None
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        vs = hsv[:, :, 2][mask == 255].astype(np.float32)
+        ss = hsv[:, :, 1][mask == 255].astype(np.float32)
+        if vs.size < 100:
+            return None
+        v_mean, v_std = float(vs.mean()), float(vs.std())
+        v_p95 = float(np.percentile(vs, 95))
+        s_mean = float(ss.mean())
+        s_median = float(np.median(ss))
+        return dict(v_mean=v_mean, v_std=v_std, v_p95=v_p95,
+                    s_mean=s_mean, s_median=s_median, count=int(vs.size))
+    except Exception:
+        return None
+
+
+def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
+                              white_v_min=150, white_s_max=60):
+    """Return per-contour diagnostics for the current HSV mask (no motion).
+
+    Used by the on-screen Tuning Assist overlay.  Each entry is a dict with
+    area_full, circularity, solidity, fill, nvert, aspect, passed_ball gate.
+    Areas are normalised to full-res px (same convention as detector sliders).
+    """
+    if frame_bgr is None or table_poly is None:
+        return [], None
+    try:
+        h, w = frame_bgr.shape[:2]
+        p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+        x0, y0, x1, y1, ox, oy = crop_for_poly((h, w), p, margin=int(roi_margin))
+        fh, fw = h, w
+        a = _align_roi_for_nv21(x0, y0, x1, y1, fw, fh)
+        if a is not None:
+            x0, y0, x1, y1 = a
+            ox, oy = x0, y0
+        crop = frame_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            return [], None
+        poly_local = p - np.array([ox, oy], dtype=np.float32)
+        small, scale = _resize_small(crop)
+        sh, sw = small.shape[:2]
+        roi = _build_roi_mask(sh, sw, poly_local, scale, int(roi_margin))
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        white = cv2.inRange(hsv, np.array([0, 0, int(white_v_min)]),
+                            np.array([180, int(white_s_max), 255]))
+        orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
+        orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
+        mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
+        mask = cv2.medianBlur(mask, 5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        if roi is not None:
+            mask = cv2.bitwise_and(mask, roi)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        inv_s2 = 1.0 / max(scale * scale, 1e-6)
+        for c in contours:
+            area_small = cv2.contourArea(c)
+            area_full = area_small * inv_s2
+            if area_full < 10 or area_full > 12000:
+                continue
+            peri = cv2.arcLength(c, True)
+            if peri < 1:
+                continue
+            circularity = 4 * np.pi * area_small / (peri * peri)
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            solidity = area_small / hull_area if hull_area > 0 else 0.0
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            fill = area_small / (np.pi * r * r) if r > 0 else 0.0
+            nvert = len(cv2.approxPolyDP(c, 0.02 * peri, True))
+            (_, _), (bw, bh), _ = cv2.minAreaRect(c)
+            aspect = (max(bw, bh) / max(min(bw, bh), 1.0)
+                      if bw > 0 and bh > 0 else 1.0)
+            # map small centroid back to full-res for drawing
+            fx, fy = cx / scale + ox, cy / scale + oy
+            out.append(dict(area=area_full, circ=circularity,
+                            solidity=solidity, fill=fill, nvert=nvert,
+                            aspect=aspect, cx=fx, cy=fy, r=r / scale,
+                            cnt=c, scale=scale, ox=ox, oy=oy))
+        # largest first so assist overlay labels the big false positives
+        out.sort(key=lambda d: d["area"], reverse=True)
+        return out, mask
+    except Exception:
+        return [], None
+
+
+def suggest_auto_params(frames_bgr, table_poly, frame_shape,
+                        base_params=None, table_mapper=None):
+    """One-shot auto-tune from a short burst of empty-table frames.
+
+    `frames_bgr` — list of BGR frames (empty table, no ball, camera static).
+    Analyses motion floor, table HSV, and spurious white blobs to suggest
+    min_area / motion_thresh / white_v_min / white_s_max / roi_margin.
+    Returns (suggested_dict, report_str).  Suggested dict contains only keys
+    that the analysis is confident about; caller may merge into live params.
+
+    Heuristics are conservative: they never propose a min_area below the
+    geometry-predicted far-ball area, and white thresholds are clamped to
+    avoid losing a white or orange ball under dim light.
+    """
+    if not frames_bgr:
+        return {}, "No frames for auto-tune."
+    if base_params is None:
+        base_params = {}
+    try:
+        # --- geometry-predicted ball area ---
+        far_area, near_area = expected_ball_area_range(table_poly, frame_shape)
+        # --- HSV stats (from median frame to be robust to one outlier) ---
+        hsv_stats = None
+        mid = frames_bgr[len(frames_bgr) // 2]
+        if mid is not None:
+            hsv_stats = _hsv_stats_inside_roi(mid, table_poly, erode_px=6)
+        # --- motion floor: inter-frame diff inside ROI ---
+        motion_floor = None
+        small_grays = []
+        for f in frames_bgr:
+            if f is None or table_poly is None:
+                continue
+            try:
+                h, w = f.shape[:2]
+                p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+                x0, y0, x1, y1, ox, oy = crop_for_poly((h, w), p,
+                                                      margin=int(base_params.get("roi_margin", 40)))
+                fh, fw = h, w
+                a = _align_roi_for_nv21(x0, y0, x1, y1, fw, fh)
+                if a is not None:
+                    x0, y0, x1, y1 = a
+                y_roi = f[y0:y1, x0:x1]
+                if y_roi.size == 0:
+                    continue
+                if y_roi.ndim == 3:
+                    y_roi_gray = cv2.cvtColor(y_roi, cv2.COLOR_BGR2GRAY)
+                else:
+                    y_roi_gray = y_roi
+                g_small, _sc = _resize_small(y_roi_gray)
+                if g_small.ndim == 3:
+                    g_small = cv2.cvtColor(g_small, cv2.COLOR_BGR2GRAY)
+                small_grays.append(g_small)
+            except Exception:
+                continue
+        if len(small_grays) >= 2:
+            diffs = []
+            for i in range(1, len(small_grays)):
+                a, b = small_grays[i - 1], small_grays[i]
+                if a.shape != b.shape:
+                    continue
+                d = cv2.absdiff(a, b)
+                # median diff inside motion — 95th percentile is more
+                # revealing for AE wobble; median may be near zero
+                diffs.append(float(np.percentile(d, 97)))
+                diffs.append(float(np.median(d.astype(np.float32))))
+            if diffs:
+                motion_floor = float(np.median(np.array(diffs)))
+        # --- max noise blob area on empty table ---
+        max_noise = 0.0
+        noise_areas = []
+        for f in frames_bgr:
+            diags, _ = debug_contours_for_frame(
+                f, table_poly,
+                roi_margin=int(base_params.get("roi_margin", 40)),
+                white_v_min=int(base_params.get("white_v_min", 150)),
+                white_s_max=int(base_params.get("white_s_max", 60)))
+            for d in diags:
+                # consider blobs up to near_area*1.2 as potential noise
+                # (larger blobs are likely shirts/walls outside ROI and
+                #  are already masked; huge blobs are ignored)
+                if d["area"] <= max(near_area * 1.8, 1200):
+                    noise_areas.append(d["area"])
+                    max_noise = max(max_noise, d["area"])
+        # p90 noise area is more robust than single max (one glint)
+        p90_noise = float(np.percentile(noise_areas, 90)) if noise_areas else max_noise
+
+        suggested = {}
+        lines = []
+
+        # min_area: noise-driven but clamped to expected ball band
+        if noise_areas:
+            cand = p90_noise * 1.15 + 18
+            # also consider absolute max with smaller multiplier
+            cand = max(cand, max_noise * 1.06 + 10)
+            # keep inside [far*1.02 , near*0.80] so far/net bounce survives
+            low = far_area * 1.02
+            high = max(near_area * 0.80, far_area + 25)
+            high = float(np.clip(high, low + 10, 420))
+            cand = float(np.clip(cand, low, high))
+            # snap to slider step 20
+            cand = int(round(cand / 20.0) * 20)
+            suggested["min_area"] = int(cand)
+            lines.append(f"min_area {base_params.get('min_area','?')} -> {cand} "
+                         f"(noise p90 {p90_noise:.0f} max {max_noise:.0f}, "
+                         f"exp far {far_area:.0f} near {near_area:.0f})")
+        else:
+            # no white blobs on empty table — trust geometry
+            geom = int(round(max(far_area * 1.10, 120) / 20) * 20)
+            geom = int(np.clip(geom, 80, 320))
+            suggested["min_area"] = geom
+            lines.append(f"min_area -> {geom} (no noise, geometry far {far_area:.0f})")
+
+        # motion_thresh: noise floor + margin, clamped for dim vs bright halls
+        if motion_floor is not None:
+            cand_m = int(round(float(np.clip(motion_floor * 1.9 + 9, 12, 55))))
+            # bright/concrete halls have higher floor; cap so slow ball not lost
+            suggested["motion_thresh"] = cand_m
+            lines.append(f"motion_thresh -> {cand_m} (floor p97 ~{motion_floor:.1f})")
+        else:
+            lines.append("motion_thresh unchanged (insufficient frames)")
+
+        # white_v_min: table V p95 + offset, so concrete glare / table shine
+        # does not become a white blob; ball is ~20-50 V brighter than table blue
+        if hsv_stats is not None:
+            v_p95 = hsv_stats["v_p95"]
+            v_mean = hsv_stats["v_mean"]
+            # table blue V ~ 110-180 indoor; white ball ~ 210-255
+            cand_v = int(round(np.clip(v_p95 + 18, 125, 210)))
+            # in very bright halls p95 already ~200 -> push to 210 max
+            # in dim halls p95 ~120 -> cand ~138, but floor at 135 keeps ball
+            cand_v = max(cand_v, 135)
+            # if user was at 150 and we propose 138, don't darken too much
+            # unless noise indicates it — keep at least base-10
+            suggested["white_v_min"] = cand_v
+            lines.append(f"white_v_min -> {cand_v} (table V mean {v_mean:.0f} p95 {v_p95:.0f})")
+            # white_s_max: table blue is saturated (~140), white is <50.
+            # Set between them: ~ 45-65 depending on table blue.
+            s_med = hsv_stats["s_median"]
+            cand_s = int(round(np.clip(s_med * 0.42, 35, 75)))
+            # hall with grey concrete (low S) may pull median down; clamp low
+            cand_s = int(np.clip(cand_s, 40, 70))
+            suggested["white_s_max"] = cand_s
+            lines.append(f"white_s_max -> {cand_s} (table S median {s_med:.0f})")
+        else:
+            lines.append("white thresholds unchanged (no HSV stats)")
+
+        # roi_margin: if table fills the frame tightly, a large margin
+        # drags in floor/wall false positives (concrete, legs).  If the
+        # quarter polygon already touches the frame edge, shrink margin.
+        try:
+            h, w = frame_shape[:2]
+            p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+            bbox_w = float(p[:, 0].max() - p[:, 0].min())
+            # if quarter occupies >45% of frame width, margin is risky
+            frac = bbox_w / max(w, 1)
+            if frac > 0.48 and int(base_params.get("roi_margin", 40)) > 30:
+                suggested["roi_margin"] = 28
+                lines.append(f"roi_margin  -> 28 (quarter {frac*100:.0f}% of frame, tight crop)")
+        except Exception:
+            pass
+
+        report = "Auto-tune suggestions:\n" + "\n".join("  " + l for l in lines)
+        report += f"\nGeometry expects ball area ~{far_area:.0f}–{near_area:.0f} full-px."
+        if noise_areas:
+            report += f"  Empty-table noise up to {max_noise:.0f} px."
+        return suggested, report
+    except Exception as e:
+        return {}, f"Auto-tune failed: {e}"
+
+
 def is_bounce(traj, min_drop=3.0, min_rise=3.0):
     """Same idea as the pickleball notebook: dy1>0 then dy2<0 (image y down).
 

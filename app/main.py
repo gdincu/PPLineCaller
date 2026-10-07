@@ -32,7 +32,9 @@ from kivy.uix.slider import Slider
 from kivy.metrics import dp
 
 from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
-                            detect_ball_nv21, BallTracker)
+                            detect_ball_nv21, BallTracker,
+                            debug_contours_for_frame, suggest_auto_params,
+                            expected_ball_area_range)
 
 from plyer import tts
 
@@ -69,11 +71,24 @@ TUNE_PARAMS = [
     ("min_rise", "Bounce rise", 1, 15, 0.5, "{:.1f}", False),
 ]
 TUNE_DEFAULTS = {
-    "min_area": 160, "max_area": 4800, "min_circ": 0.65,
+    "min_area": 200, "max_area": 4800, "min_circ": 0.65,
     "min_circ_streak": 0.35, "max_aspect": 4.0,
     "min_solidity": 0.85, "min_fill": 0.70, "min_vertices": 6,
     "roi_margin": 40, "motion_thresh": 25, "white_v_min": 150,
     "white_s_max": 60, "max_jump": 180.0, "confirm_streak": 1,
+    "min_drop": 3.0, "min_rise": 3.0,
+}
+
+# Recommended preset for the reference table view (user image: blue Sponeta
+# 6-53i, indoor concrete hall, phone at right edge looking slightly down
+# the table). Tighter white + area gates cut the concrete/glare false
+# positives seen with defaults while still seeing the ball at the far end.
+RECOMMENDED_TABLE_PRESET = {
+    "min_area": 200, "max_area": 3200, "min_circ": 0.65,
+    "min_circ_streak": 0.35, "max_aspect": 4.0,
+    "min_solidity": 0.85, "min_fill": 0.70, "min_vertices": 6,
+    "roi_margin": 30, "motion_thresh": 28, "white_v_min": 165,
+    "white_s_max": 55, "max_jump": 180.0, "confirm_streak": 1,
     "min_drop": 3.0, "min_rise": 3.0,
 }
 
@@ -144,6 +159,12 @@ class ServeApp(App):
         self._tune_sliders = {}
         self._tune_values = {}
         self._tune_spec = {k: (fmt, is_int) for k, _, _, _, _, fmt, is_int in TUNE_PARAMS}
+        # Tuning Assist / Auto-Tune state
+        self.assist_mode = False
+        self.assist_mask_preview = False
+        self._assist_stats = ""
+        self._auto_frames = None  # list[BGR] while collecting
+        self._auto_needed = 0
 
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
@@ -174,6 +195,22 @@ class ServeApp(App):
         tune_bar.add_widget(self.tune_toggle)
         tune_bar.add_widget(b_defaults)
         root.add_widget(tune_bar)
+        # Assist + Auto-Tune row (always visible, compact)
+        assist_bar = BoxLayout(size_hint_y=0.10)
+        self.assist_btn = Button(text="ASSIST OFF")
+        self.assist_btn.bind(on_press=self.toggle_assist)
+        b_mask = Button(text="MASK OFF")
+        b_mask.bind(on_press=self.toggle_mask_preview)
+        self._mask_btn = b_mask
+        b_auto = Button(text="AUTO TUNE")
+        b_auto.bind(on_press=self.start_auto_tune)
+        b_preset = Button(text="TABLE PRESET")
+        b_preset.bind(on_press=self.apply_table_preset)
+        assist_bar.add_widget(self.assist_btn)
+        assist_bar.add_widget(b_mask)
+        assist_bar.add_widget(b_auto)
+        assist_bar.add_widget(b_preset)
+        root.add_widget(assist_bar)
         self.tune_scroll = ScrollView(size_hint_y=None, height=0)
         self.tune_grid = GridLayout(cols=3, size_hint_y=None,
                                     spacing=dp(4), padding=dp(4))
@@ -249,6 +286,157 @@ class ServeApp(App):
         self.tracker.confirm_streak = int(p["confirm_streak"])
         self.caller.min_drop = float(p["min_drop"])
         self.caller.min_rise = float(p["min_rise"])
+
+    # -- assist / auto-tune ---------------------------------------------
+    def toggle_assist(self, *_):
+        self.assist_mode = not self.assist_mode
+        self.assist_btn.text = "ASSIST ON" if self.assist_mode else "ASSIST OFF"
+        if self.assist_mode:
+            self.status.text = "Assist ON: yellow=candidates, red=tracked. Tune sliders live."
+        else:
+            self.status.text = "Assist OFF."
+            self._assist_stats = ""
+
+    def toggle_mask_preview(self, *_):
+        self.assist_mask_preview = not self.assist_mask_preview
+        self._mask_btn.text = "MASK ON" if self.assist_mask_preview else "MASK OFF"
+        self.status.text = "Mask preview ON (HSV white mask)" if self.assist_mask_preview else "Mask preview OFF"
+
+    def apply_table_preset(self, *_):
+        """One-tap preset tuned for the reference Sponeta hall view."""
+        self.params.update(RECOMMENDED_TABLE_PRESET)
+        for key, (fmt, _is_int) in self._tune_spec.items():
+            if key in RECOMMENDED_TABLE_PRESET:
+                self._tune_sliders[key].value = self.params[key]
+                self._tune_values[key].text = fmt.format(self.params[key])
+        self._apply_live_settings()
+        far_a, near_a = expected_ball_area_range(
+            self.table.quarter_poly("server_right") if self.table.H is not None else None,
+            getattr(self, "frame", np.zeros((720, 1280, 3), dtype=np.uint8)).shape)
+        self.status.text = (f"Table preset applied (min_area {RECOMMENDED_TABLE_PRESET['min_area']}, "
+                            f"white V {RECOMMENDED_TABLE_PRESET['white_v_min']}). "
+                            f"Exp ball {far_a:.0f}-{near_a:.0f}px. Fine-tune or AUTO TUNE next.")
+        Logger.info(f"PPLineCaller: table preset applied {RECOMMENDED_TABLE_PRESET}")
+
+    def start_auto_tune(self, *_):
+        if self.table.H is None:
+            self.status.text = "Calibrate first (4 corners), then AUTO TUNE on empty table."
+            return
+        if self._auto_frames is not None:
+            self.status.text = "Auto-tune already running..."
+            return
+        # Keep current frame as reference, collect ~45 frames (~1.5s)
+        # Caller must keep the table empty and the phone still.
+        self._auto_frames = []
+        self._auto_needed = 45
+        self.status.text = "AUTO TUNE: keep table EMPTY & still for 2s... (collecting)"
+        Logger.info("PPLineCaller: auto-tune start, collecting 45 frames")
+
+    def _finish_auto_tune(self):
+        frames = self._auto_frames or []
+        self._auto_frames = None
+        self._auto_needed = 0
+        if len(frames) < 5:
+            self.status.text = "Auto-tune: not enough frames (camera not ready)."
+            return
+        try:
+            qpoly = self.table.quarter_poly("server_right")
+            shape = frames[0].shape
+            suggested, report = suggest_auto_params(
+                frames, qpoly, shape,
+                base_params=dict(self.params),
+                table_mapper=self.table)
+            Logger.info(f"PPLineCaller: auto-tune report:\n{report}\nframes={len(frames)}")
+            # Apply suggested keys live and move sliders so user sees them
+            for k, v in suggested.items():
+                self.params[k] = v
+                if k in self._tune_sliders:
+                    self._tune_sliders[k].value = v
+                    fmt, _is = self._tune_spec[k]
+                    self._tune_values[k].text = fmt.format(v)
+            self._apply_live_settings()
+            # Show concise status + keep full report in logcat
+            changes = ", ".join(f"{k}={v}" for k, v in suggested.items())
+            self.status.text = f"Auto-tune done ({len(frames)} fr): {changes}. Check logcat for details. Turn ASSIST ON to verify."
+            # Auto-enable assist so user can immediately see the effect
+            if not self.assist_mode:
+                self.assist_mode = True
+                self.assist_btn.text = "ASSIST ON"
+        except Exception as e:
+            Logger.exception(f"PPLineCaller: auto-tune failed: {e}")
+            self.status.text = f"Auto-tune failed: {e}"
+
+    def _draw_assist_overlay(self, frame, qpoly):
+        """Yellow candidate contours + stats for live tuning. No-op if not assist."""
+        if not self.assist_mode or qpoly is None:
+            return
+        try:
+            p = self.params
+            diags, mask = debug_contours_for_frame(
+                frame, qpoly,
+                roi_margin=int(p["roi_margin"]),
+                white_v_min=int(p["white_v_min"]),
+                white_s_max=int(p["white_s_max"]))
+            # Draw candidates (up to 10 largest)
+            for i, d in enumerate(diags[:10]):
+                cx, cy = int(d["cx"]), int(d["cy"])
+                r = int(max(d["r"], 3))
+                # contour outline in yellow
+                cnt = d["cnt"]
+                # map small contour back to full-res for drawing
+                # cnt is in small space; rebuild full-res points
+                sc = d["scale"]; ox = d["ox"]; oy = d["oy"]
+                pts = (d["cnt"].astype(np.float32) / sc)
+                # pts are still in small crop coords; need offset
+                # _resize_small lost origin; instead draw circle + area text
+                # (accurate polygon would need roi transform) — circle is enough
+                is_pass = (d["area"] >= p["min_area"] and d["area"] <= p["max_area"]
+                           and d["circ"] >= 0.30)  # rough
+                col = (0, 255, 255) if not is_pass else (0, 165, 255)  # yellow vs orange
+                cv2.circle(frame, (cx, cy), r, col, 1)
+                # area label for the 4 largest
+                if i < 4:
+                    label = f"{d['area']:.0f} c{d['circ']:.2f}"
+                    cv2.putText(frame, label, (cx + r + 2, cy),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, col, 1)
+            # stats bar at bottom (avoid top-left where MY used to be)
+            n = len(diags)
+            far_a, near_a = expected_ball_area_range(qpoly, frame.shape)
+            max_a = max((d["area"] for d in diags), default=0)
+            motion_txt = ""
+            if n:
+                motion_txt = f"max noise {max_a:.0f}px"
+            else:
+                motion_txt = "no white blobs"
+            stats = f"ASSIST cands={n} {motion_txt} | exp ball {far_a:.0f}-{near_a:.0f} | min_area {p['min_area']:.0f}"
+            self._assist_stats = stats
+            # draw semi-transparent bar
+            cv2.rectangle(frame, (0, frame.shape[0] - 22), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
+            cv2.putText(frame, stats, (6, frame.shape[0] - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1)
+            # optionally composite mask as inset if requested
+            if self.assist_mask_preview and mask is not None:
+                try:
+                    # mask is small; resize to 1/4 preview inset
+                    mh, mw = mask.shape[:2]
+                    inset_w = min(320, frame.shape[1] // 3)
+                    inset_h = int(inset_w * mh / max(mw, 1))
+                    small_mask = cv2.resize(mask, (inset_w, inset_h))
+                    # convert to BGR for overlay
+                    inset = cv2.cvtColor(small_mask, cv2.COLOR_GRAY2BGR)
+                    # place at top-right with border
+                    x1 = frame.shape[1] - inset_w - 6
+                    y1 = 6
+                    x2, y2 = x1 + inset_w, y1 + inset_h
+                    cv2.rectangle(frame, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), (255, 255, 255), 1)
+                    frame[y1:y2, x1:x2] = inset
+                    cv2.putText(frame, "HSV mask", (x1, y1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                except Exception:
+                    pass
+        except Exception as e:
+            Logger.info(f"PPLineCaller: assist draw failed: {e}")
+
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
         self.calib_pts = []
@@ -585,6 +773,29 @@ class ServeApp(App):
             return
         _buf, w, h, nv21 = raw
         self._tick_count += 1
+        # -- auto-tune collection (empty-table burst) -------------------
+        if self._auto_frames is not None:
+            frame_at = self._decode_full_nv21(nv21, w, h, _buf)
+            if frame_at is not None:
+                self.frame = frame_at
+                self._auto_frames.append(frame_at.copy())
+                n = len(self._auto_frames)
+                self.status.text = f"AUTO TUNE: keep still... {n}/{self._auto_needed} frames"
+                # small progress bar
+                try:
+                    bar_w = int(frame_at.shape[1] * n / max(self._auto_needed, 1))
+                    cv2.rectangle(frame_at, (0, frame_at.shape[0] - 8),
+                                  (bar_w, frame_at.shape[0]), (0, 255, 0), -1)
+                except Exception:
+                    pass
+                # keep minimal overlay so user sees live view
+                qp = self.table.quarter_poly("server_right") if self.table.H is not None else None
+                if qp is not None:
+                    cv2.polylines(frame_at, [qp.astype(int)], True, (0, 255, 0), 3)
+                self._upload(frame_at)
+                if n >= self._auto_needed:
+                    self._finish_auto_tune()
+            return
         if self.calibrating:
             frame = self._decode_full_nv21(nv21, w, h, _buf)
             if frame is None:
@@ -669,16 +880,18 @@ class ServeApp(App):
                 if pos is not None:
                     x, y = (int(pos[0]), int(pos[1]))
                     cv2.circle(frame, (x, y), max(r_draw, 4), (0, 0, 255), 2)
-                # draw MY quadrant (thick) + bounces (corners == quadrant)
+                # draw MY quadrant (thick outline only — MY label removed)
                 if qpoly is not None:
                     cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
-                    cv2.putText(frame, "MY",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                (0, 255, 0), 2)
                 for i, (bx, by, q) in enumerate(self.caller.bounces):
                     cv2.circle(frame, (int(bx), int(by)), 8, (255, 0, 0), -1)
                     cv2.putText(frame, f"B{i+1}:{q}", (int(bx) + 10, int(by)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+                # Tuning Assist overlay (candidates / expected ball / mask inset)
+                try:
+                    self._draw_assist_overlay(frame, qpoly)
+                except Exception:
+                    pass
                 self._upload(frame)
         # tick-time log: proves processed FPS holds 30 (33ms budget).
         ms = (time.perf_counter() - t0) * 1000.0
