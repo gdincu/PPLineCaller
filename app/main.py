@@ -5,17 +5,15 @@ no desktop/webcam path.
 
 Flow:
   1. Fix the phone at your end of the table on your right-hand edge
-     (tripod, landscape), framing the whole table. Both phones tap the
-     corners positionally from their own end, so each phone's own quarter
-     always lands on the same warp slot — no mode or quarter setting.
-  2. Tap CALIBRATE then tap the 4 table corners IN ORDER from YOUR end as
-     you face the table:
-        1. NEAR-RIGHT (your end, your right)
-        2. NEAR-LEFT  (your end, your left)
-        3. FAR-LEFT (far end, same long edge as 2)
-        4. FAR-RIGHT (far end, same long edge as 1)
-  3. Tap START SERVE, serve, app speaks/shows IN or FAULT for the first
-     bounce seen: inside my quarter -> IN, else FAULT.
+     (tripod, landscape), framing YOUR OWN quadrant only. Each phone's
+     own quarter always lands on the same warp slot — no mode setting.
+  2. Tap CALIBRATE then tap YOUR quadrant corners IN ORDER from YOUR end:
+        1. NEAR-RIGHT outer corner (your end, your right)
+        2. NEAR-CENTRE (your end, end line + centre line)
+        3. FAR-CENTRE (net + centre line)
+        4. FAR-RIGHT (net + sideline / net post)
+  3. Tap START SERVE, serve, app speaks/shows IN when a bounce lands
+     inside my quarter (+line pad). Anything else stays silent.
 """
 import cv2
 import numpy as np
@@ -34,21 +32,20 @@ from kivy.uix.slider import Slider
 from kivy.metrics import dp
 
 from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
-                            BallTracker)
+                            detect_ball_nv21, BallTracker)
 
 from plyer import tts
 
-# Ordered calibration prompts (positional: from your own end as you face
-# the table — same order on both phones, so each phone's own quarter lands
-# on the tap-1 warp slot).
+# Ordered calibration prompts: YOUR quadrant only (same order on both
+# phones, so each phone's own quarter lands on the tap-1 warp slot).
 CALIB_STEPS = (
-    "NEAR-RIGHT (your end, your right)",
-    "NEAR-LEFT (your end, your left)",
-    "FAR-LEFT (far end, same edge as NEAR-LEFT)",
-    "FAR-RIGHT (far end, same edge as NEAR-RIGHT)",
+    "NEAR-RIGHT outer corner (your end, your right)",
+    "NEAR-CENTRE (your end, end line + centre line)",
+    "FAR-CENTRE (net + centre line)",
+    "FAR-RIGHT (net + sideline / net post)",
 )
 # Short tags drawn next to each tapped point on the preview.
-CALIB_SHORT = ("1 NR", "2 NL", "3 FL", "4 FR")
+CALIB_SHORT = ("1 NR", "2 NC", "3 FC", "4 FR")
 
 # Live-tuning panel (collapsed by default). Defaults equal the hardcoded
 # detector/tracker/bounce settings. Row format:
@@ -303,11 +300,9 @@ class ServeApp(App):
             if n < 4:
                 self.status.text = f"Tap {n + 1}/4: {CALIB_STEPS[n]}"
             else:
-                # Positional taps from your own end: tap-1 (near-right) is
-                # MY quarter on every phone, so no quarter selection needed.
-                near_r, near_l, far_l, far_r = self.calib_pts
-                self.table.set_corners_table_order(near_r, near_l,
-                                                   far_l, far_r)
+                # Quadrant-only taps: MY quarter on every phone.
+                nr, nc, fc, fr = self.calib_pts
+                self.table.set_corners_quadrant_order(nr, nc, fc, fr)
                 self.calibrating = False
                 self.caller = ServeCaller(self.table)
                 self.tracker.reset()
@@ -505,7 +500,13 @@ class ServeApp(App):
                 self._actual_size = tuple(self.cam.resolution)
         return self._actual_size
 
-    def _read_frame(self):
+    def _grab_nv21(self):
+        """Grab one preview buffer as (buf, w, h, nv21) without decoding.
+
+        Splits the old _read_frame into grab vs decode so tick() can run
+        the ROI-first path (b): Y-plane motion check + ROI-only BGR decode,
+        decoding the full frame only when an upload/render is due.
+        """
         if self.cam is None:
             return None
         try:
@@ -515,16 +516,26 @@ class ServeApp(App):
         if buf is None:
             return None
         try:
-            # NV21 -> BGR, same conversion Kivy's read_frame() does
-            # (np.fromstring was removed in numpy 2.x, hence manual).
             w, h = self._preview_size()
             n = w * (h + h // 2)
             arr = np.frombuffer(buf, dtype=np.uint8)[:n].reshape((h + h // 2, w))
-            frame = cv2.cvtColor(arr, cv2.COLOR_YUV2BGR_NV21)
+            return buf, w, h, arr
+        except Exception as e:
+            if not getattr(self, "_decode_err_logged", False):
+                self._decode_err_logged = True
+                Logger.exception(f"PPLineCaller: frame grab failed: {e}")
+                self.status.text = f"Frame decode error: {e}"
+            return None
+
+    def _decode_full_nv21(self, nv21, w, h, buf=None):
+        """Full-frame NV21 -> BGR (same conversion Kivy's read_frame() does)."""
+        try:
+            frame = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV21)
             if not getattr(self, "_frame_logged", False):
                 self._frame_logged = True
-                Logger.info(f"PPLineCaller: buf={len(buf)} preview={w}x{h} "
-                            f"Y mean={arr[:h].mean():.1f} BGR mean={frame.mean():.1f}")
+                blen = len(buf) if buf is not None else -1
+                Logger.info(f"PPLineCaller: buf={blen} preview={w}x{h} "
+                            f"Y mean={nv21[:h].mean():.1f} BGR mean={frame.mean():.1f}")
             return frame
         except Exception as e:
             if not getattr(self, "_decode_err_logged", False):
@@ -532,6 +543,13 @@ class ServeApp(App):
                 Logger.exception(f"PPLineCaller: frame decode failed: {e}")
                 self.status.text = f"Frame decode error: {e}"
             return None
+
+    def _read_frame(self):
+        raw = self._grab_nv21()
+        if raw is None:
+            return None
+        _buf, w, h, nv21 = raw
+        return self._decode_full_nv21(nv21, w, h, _buf)
 
     def say(self, text):
         """Speak without blocking the 30Hz tick: tts.speak() on Android can
@@ -562,25 +580,36 @@ class ServeApp(App):
     def tick(self, _dt):
         import time
         t0 = time.perf_counter()
-        frame = self._read_frame()
-        if frame is None:
+        raw = self._grab_nv21()
+        if raw is None:
             return
-        self.frame = frame
+        _buf, w, h, nv21 = raw
         self._tick_count += 1
         if self.calibrating:
+            frame = self._decode_full_nv21(nv21, w, h, _buf)
+            if frame is None:
+                return
+            self.frame = frame
             self._draw_calib_points(frame)
             self._upload(frame)
             return
-        if self.table.H is not None:
+        if self.table.H is None:
+            frame = self._decode_full_nv21(nv21, w, h, _buf)
+            if frame is None:
+                return
+            self.frame = frame
+            self._upload(frame)
+        else:
             p = self.params
-            # Quarter-ROI: only MY quarter (tap-1 slot) is processed. Keeps
-            # the 4-corner homography (stable lines) but crops HSV/contours
-            # to ~1/4 pixels + top_extra for the incoming ball.
+            # ROI-first (b): Y-plane motion check + ROI-only BGR decode.
+            # Full-frame BGR is decoded only when an upload/render is due;
+            # static ROI-only frames skip colour decode + HSV entirely (c).
+            # self.frame keeps the last full frame for tap mapping/overlays
+            # (resolution is fixed, so stale shape still maps correctly).
             qpoly = self.table.quarter_poly("server_right")
-            det, curr_small = detect_ball_hsv(
-                frame, self.tracker.pos, table_poly=qpoly,
-                prev_small=self._prev_small, min_area=p["min_area"],
-                max_area=p["max_area"], min_circ=p["min_circ"],
+            det_kwargs = dict(
+                min_area=p["min_area"], max_area=p["max_area"],
+                min_circ=p["min_circ"],
                 min_circ_streak=p["min_circ_streak"],
                 max_aspect=p["max_aspect"],
                 min_solidity=p["min_solidity"], min_fill=p["min_fill"],
@@ -589,16 +618,35 @@ class ServeApp(App):
                 motion_thresh=int(p["motion_thresh"]),
                 white_v_min=int(p["white_v_min"]),
                 white_s_max=int(p["white_s_max"]))
+            frame = None
+            # Anticipate the render throttle: non-live states and every
+            # Nth live tick need a full frame; other live ticks run ROI-only.
+            want_full = (self.caller.state != "SERVE_LIVE"
+                         or (self._tick_count % self._render_every == 0))
+            if qpoly is None:
+                want_full = True
+            if want_full:
+                frame = self._decode_full_nv21(nv21, w, h, _buf)
+                if frame is None:
+                    return
+                self.frame = frame
+                det, curr_small = detect_ball_hsv(
+                    frame, self.tracker.pos, table_poly=qpoly,
+                    prev_small=self._prev_small, **det_kwargs)
+            else:
+                det, curr_small = detect_ball_nv21(
+                    nv21, w, h, self.tracker.pos, table_poly=qpoly,
+                    prev_small=self._prev_small, **det_kwargs)
             if curr_small is not None:
                 self._prev_small = curr_small
             pos = self.tracker.update((det[0], det[1]) if det else None)
             # coasted predictions reuse last radius for drawing
             r_draw = int(det[2]) if det else 6
             verdict = self.caller.update(pos)
-            if verdict:
-                self.status.text = f"{verdict}: {self.caller.reason}"
+            if verdict == "IN":
+                self.status.text = f"IN: {self.caller.reason}"
                 if not self._said:
-                    self.say("In" if verdict == "IN" else "Fault")
+                    self.say("In")
                     self._said = True
             else:
                 self._said = False
@@ -606,28 +654,32 @@ class ServeApp(App):
                     self.status.text = (f"Watching serve... "
                                         f"bounces={len(self.caller.bounces)}")
             # Render throttle: detect every frame, upload overlays at ~15Hz
-            # during live rallies (saves flip/cvtColor/tobytes/blit per frame);
+            # during live rallies (saves full decode + flip/cvtColor/blit);
             # always render when decided/calibrated so calls are visible.
             live = self.caller.state == "SERVE_LIVE" and not verdict
             should_render = (not live) or (self._tick_count % self._render_every == 0)
             if should_render:
+                if frame is None:
+                    # Verdict landed on an ROI-only tick: decode the full
+                    # frame now from the same buffer for the overlay/upload.
+                    frame = self._decode_full_nv21(nv21, w, h, _buf)
+                    if frame is None:
+                        return
+                    self.frame = frame
                 if pos is not None:
                     x, y = (int(pos[0]), int(pos[1]))
                     cv2.circle(frame, (x, y), max(r_draw, 4), (0, 0, 255), 2)
-                # draw MY quarter (thick) + full table (thin) + bounces
+                # draw MY quadrant (thick) + bounces (corners == quadrant)
                 if qpoly is not None:
                     cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
                     cv2.putText(frame, "MY",
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                 (0, 255, 0), 2)
-                cv2.polylines(frame, [self.table.corners.astype(int)], True, (0, 255, 0), 1)
                 for i, (bx, by, q) in enumerate(self.caller.bounces):
                     cv2.circle(frame, (int(bx), int(by)), 8, (255, 0, 0), -1)
                     cv2.putText(frame, f"B{i+1}:{q}", (int(bx) + 10, int(by)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
                 self._upload(frame)
-        else:
-            self._upload(frame)
         # tick-time log: proves processed FPS holds 30 (33ms budget).
         ms = (time.perf_counter() - t0) * 1000.0
         self._tick_ms_ema = ms if self._tick_count <= 1 else 0.9 * self._tick_ms_ema + 0.1 * ms

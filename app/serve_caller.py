@@ -8,14 +8,12 @@ Android-only: runs as an APK (Kivy + OpenCV). No desktop/webcam path.
 
 Camera assumption: one phone per judged quarter, on a tripod at your
 end of the table on your right-hand edge (phones end up diagonal to each
-other), landscape, framing the whole table. Calibration taps are positional
-— given from YOUR end as you face the table, same order on both phones:
-  1. near-right, 2. near-left, 3. far-left, 4. far-right
-Because both phones tap positionally, each phone's own quarter always lands
-on the same warp slot (bottom-right). There is no per-phone mode or quarter
-selection: the verdict is always "bounce inside tap-1 quad (+line pad) ->
-IN, else FAULT", identical on both phones. Cross-half bounces never enter
-the quarter-cropped track, so no ignore-other-half logic is needed.
+other), landscape, framing YOUR OWN quadrant only. Calibration taps are
+your quadrant corners from YOUR end, same order on both phones:
+  1. near-right outer, 2. near-centre, 3. far-centre, 4. far-right.
+Each phone's own quarter always lands on the same warp slot
+(bottom-right). IN-only: bounce inside my quad (+line pad,
+quarter_table_rect(pad=10)) -> IN, else silence (keep watching).
 We warp the table to a top-down rectangle with a 4-point homography.
 After warp:
   - table rect: (0,0) - (W,H), net at y=H/2, centre line at x=W/2
@@ -49,12 +47,14 @@ def order_corners(pts):
 class TableMapper:
     """4-click calibration -> homography to top-down view.
 
-    Preferred: set_corners_table_order() with taps in positional order from
-    your own end as you face the table (near-right, near-left, far-left,
-    far-right). Same order on both phones; each phone's own quarter always
-    lands on the warp bottom-right slot.
-    Legacy: set_corners() auto-orders 4 unordered taps; only reliable for
-    the behind-server end view.
+    Preferred: set_corners_quadrant_order() with 4 taps around YOUR OWN
+    quadrant only (no need to frame the whole table):
+      1. near-right outer corner, 2. near-centre (end line + centre line),
+      3. far-centre (net + centre), 4. far-right (net + sideline).
+    Each phone's own quarter always lands on the warp bottom-right slot
+    ("server_right").
+    Legacy: set_corners_table_order() (full-table 4 corners) and
+    set_corners() (auto-ordered) are kept for backwards compatibility.
     """
 
     def __init__(self, corners_bgr_ordered=None):
@@ -63,15 +63,37 @@ class TableMapper:
         if corners_bgr_ordered is not None:
             self.set_corners(corners_bgr_ordered)
 
+    def set_corners_quadrant_order(self, near_right_outer, near_centre,
+                                    far_centre, far_right):
+        """Set homography from 4 taps around YOUR OWN quadrant only.
+
+        Args are (x, y) camera pixels, tapped from your own end:
+          near_right_outer: your end, your right table corner -> warp (W, H)
+          near_centre: your end, end line + centre line -> warp (hw, H)
+          far_centre: net + centre line -> warp (hw, hh)
+          far_right: net + sideline (net post) -> warp (W, hh)
+        Only this quadrant maps correctly; points far outside it
+        extrapolate and are ignored (IN-only mode never faults them).
+        """
+        hw, hh = WARP_W / 2.0, WARP_H / 2.0
+        src = np.array([near_right_outer, near_centre,
+                        far_centre, far_right], dtype=np.float32)
+        dst = np.array([[WARP_W, WARP_H], [hw, WARP_H],
+                        [hw, hh], [WARP_W, hh]], dtype=np.float32)
+        self.corners = src
+        self.H = cv2.getPerspectiveTransform(src, dst)
+
     def set_corners_table_order(self, near_right, near_left,
-                                far_left, far_right):
-        """Set homography from 4 taps in positional order.
+                                 far_left, far_right):
+        """Set homography from 4 full-table taps in positional order.
 
         Args are (x, y) camera pixels, tapped from your own end:
           near_right: your end, your right -> warp (W, H) (MY quarter)
           near_left:  your end, your left  -> warp (0, H)
           far_left:   far end, same edge   -> warp (0, 0)
           far_right:  far end, same edge   -> warp (W, 0)
+        Kept for backwards compatibility; quadrant-only calibration above
+        is preferred (narrow phones can't frame the whole table).
         """
         src = np.array([near_right, near_left,
                         far_left, far_right], dtype=np.float32)
@@ -206,83 +228,41 @@ def small_gray(frame_bgr, width=640):
     return small, scale
 
 
-def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
-                    min_area=160.0, max_area=4800.0, min_circ=0.65,
-                    min_solidity=0.85, min_fill=0.70, min_vertices=6,
-                    min_circ_streak=0.35, max_aspect=4.0,
-                    roi_margin=40, motion_thresh=25, white_v_min=150,
-                    white_s_max=60):
-    """Zero-training white/orange ball detector. Returns (det, curr_small).
+def _build_roi_mask(h, w, poly_local, scale, roi_margin):
+    """Small-res ROI mask for a crop, or None if no polygon."""
+    if poly_local is None:
+        return None
+    roi = np.zeros((h, w), dtype=np.uint8)
+    pts = (np.asarray(poly_local, dtype=np.float32) * scale).astype(np.int32)
+    if len(pts) < 3:
+        return None
+    cv2.fillPoly(roi, [pts], 255)
+    if roi_margin > 0:
+        # dilate in small-px: roi_margin was full-res, convert
+        k = max(int(float(roi_margin) * scale), 1)
+        # cap kernel so a big margin can't swallow the whole crop
+        k = min(k, min(h, w) // 2 or 1)
+        roi = cv2.dilate(roi, np.ones((k, k), np.uint8))
+    return roi
 
-    det is (x, y, r) in full-res coords or None; curr_small is the cropped
-    small gray frame to store as prev_small next tick (avoids a 2nd resize).
 
-    Quarter-ROI: pass the judged quarter polygon (TableMapper.quarter_poly)
-    as table_poly. The frame is first cropped to the polygon bbox (+ margin
-    + top_extra for the incoming ball), then downscaled to 640px wide, so
-    HSV + contours run on ~1/4 the pixels. Areas are normalised to full-res
-    px (area_full = area_small / scale^2) so sliders survive crop changes.
+def _motion_mask(gray, prev_small, motion_thresh):
+    """Dilated binary motion mask, or None if shapes mismatch (acquire)."""
+    if prev_small is None or prev_small.shape != gray.shape:
+        return None
+    diff = cv2.absdiff(gray, prev_small)
+    _, mot = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
+    mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
+    return mot
 
-    Shape has two paths:
-      round  - classic gates (min_circ/min_solidity/min_fill/min_vertices).
-      streak - fast-serve motion blur: circ >= min_circ_streak and
-               minAreaRect aspect <= max_aspect (2-4 typical at 30 FPS),
-               with relaxed solidity/fill/vertices. Round scores higher so
-               slow balls still prefer the strict path.
-    Tune V thresholds for your hall lighting. Works best with dark background.
-    """
-    if frame_bgr is None:
-        return None, None
-    if frame_bgr.ndim == 2:
-        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
 
-    ox, oy = 0, 0
-    crop = frame_bgr
-    poly_local = None
-    if table_poly is not None:
-        p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
-        if len(p) >= 3:
-            x0, y0, x1, y1, ox, oy = crop_for_poly(frame_bgr.shape, p,
-                                                   margin=int(roi_margin))
-            crop = frame_bgr[y0:y1, x0:x1]
-            if crop.size == 0:
-                return None, prev_small
-            poly_local = p - np.array([ox, oy], dtype=np.float32)
-
-    small, scale = _resize_small(crop)
-    h, w = small.shape[:2]
-    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-
-    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
-                        np.array([180, white_s_max, 255]))
-    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
-    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
-    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
-    mask = cv2.medianBlur(mask, 5)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-
-    if poly_local is not None:
-        roi = np.zeros((h, w), dtype=np.uint8)
-        pts = (poly_local * scale).astype(np.int32)
-        if len(pts) >= 3:
-            cv2.fillPoly(roi, [pts], 255)
-            if roi_margin > 0:
-                # dilate in small-px: roi_margin was full-res, convert
-                k = max(int(float(roi_margin) * scale), 1)
-                # cap kernel so a big margin can't swallow the whole crop
-                k = min(k, min(h, w) // 2 or 1)
-                roi = cv2.dilate(roi, np.ones((k, k), np.uint8))
-            mask = cv2.bitwise_and(mask, roi)
-
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    if prev_small is not None and prev_small.shape == gray.shape:
-        diff = cv2.absdiff(gray, prev_small)
-        _, mot = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
-        mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
-        mask = cv2.bitwise_and(mask, mot)
-    # else: first frame / bbox changed -> skip motion gate so track can acquire
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def _score_mask_contours(mask, scale, ox, oy, last_pos,
+                         min_area, max_area, min_circ, min_solidity,
+                         min_fill, min_vertices,
+                         min_circ_streak, max_aspect):
+    """Shared contour scoring for BGR and NV21-ROI paths. Returns best det."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     best, best_score = None, 0
     inv_scale2 = 1.0 / max(scale * scale, 1e-6)
     for c in contours:
@@ -331,6 +311,247 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
         if score > best_score:
             best_score = score
             best = (cx / scale + ox, cy / scale + oy, r_full)
+    return best
+
+
+def _align_roi_for_nv21(x0, y0, x1, y1, w, h):
+    """Even-align an ROI bbox for NV21 chroma subsampling (UV is half-res).
+
+    x is byte-interleaved VU so both edges must be even; y UV rows are
+    y//2 so height must be even. Returns (x0a, y0a, x1a, y1a) or None if
+    the ROI is too small to decode.
+    """
+    x0a = max((int(x0) // 2) * 2, 0)
+    x1a = min(((int(x1) + 1) // 2) * 2, w)
+    y0a = max(int(y0), 0)
+    y1a = min(int(y1), h)
+    if y1a - y0a >= 2 and (y1a - y0a) % 2 == 1:
+        # shrink by one row to keep height even (prefer keeping y0)
+        if y1a < h:
+            pass  # y1a stays, adjust below by -1
+        y1a -= 1
+    if x1a - x0a < 4 or y1a - y0a < 4:
+        return None
+    return x0a, y0a, x1a, y1a
+
+
+def decode_nv21_roi(nv21, w, h, x0, y0, x1, y1):
+    """Decode only an ROI of an NV21 buffer to BGR.
+
+    nv21: uint8 array shaped (h + h//2, w). Returns (bgr_roi, ox, oy)
+    with (ox, oy) = full-res origin, or (None, x0, y0) if too small.
+    """
+    a = _align_roi_for_nv21(x0, y0, x1, y1, w, h)
+    if a is None:
+        return None, int(x0), int(y0)
+    x0a, y0a, x1a, y1a = a
+    roi_h, roi_w = y1a - y0a, x1a - x0a
+    y_plane = nv21[:h, :]
+    vu_plane = nv21[h:, :]
+    y_roi = y_plane[y0a:y1a, x0a:x1a]
+    # UV rows cover 2 luma rows each
+    vu_roi = vu_plane[(y0a // 2):(y1a // 2), x0a:x1a]
+    expect_vu_rows = roi_h // 2
+    if (y_roi.shape != (roi_h, roi_w)
+            or vu_roi.shape != (expect_vu_rows, roi_w)):
+        return None, int(x0), int(y0)
+    chunk = np.vstack([y_roi, vu_roi])
+    bgr = cv2.cvtColor(chunk, cv2.COLOR_YUV2BGR_NV21)
+    return bgr, x0a, y0a
+
+
+def y_gray_small_from_nv21(nv21, w, h, x0, y0, x1, y1, width=640):
+    """Downscaled gray ROI straight from the NV21 Y (luma) plane.
+
+    No BGR/HSV decode needed — this feeds the motion-first check (c).
+    Uses the same even-aligned bbox as decode_nv21_roi so the scale and
+    prev_small shape match the colour ROI path. Returns
+    (gray_small, scale, ox, oy) or (None, 1.0, x0, y0) if too small.
+    """
+    a = _align_roi_for_nv21(x0, y0, x1, y1, w, h)
+    if a is None:
+        return None, 1.0, int(x0), int(y0)
+    x0a, y0a, x1a, y1a = a
+    y_roi = nv21[:h, :][y0a:y1a, x0a:x1a]
+    if y_roi.size == 0:
+        return None, 1.0, x0a, y0a
+    rh, rw = y_roi.shape[:2]
+    scale = min(1.0, width / max(rw, 1))
+    if scale >= 1.0:
+        return y_roi.copy(), 1.0, x0a, y0a
+    small = cv2.resize(y_roi, (max(int(rw * scale), 1),
+                               max(int(rh * scale), 1)))
+    return small, scale, x0a, y0a
+
+
+def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
+                    min_area=160.0, max_area=4800.0, min_circ=0.65,
+                    min_solidity=0.85, min_fill=0.70, min_vertices=6,
+                    min_circ_streak=0.35, max_aspect=4.0,
+                    roi_margin=40, motion_thresh=25, white_v_min=150,
+                    white_s_max=60):
+    """Zero-training white/orange ball detector. Returns (det, curr_small).
+
+    det is (x, y, r) in full-res coords or None; curr_small is the cropped
+    small gray frame to store as prev_small next tick (avoids a 2nd resize).
+
+    Quarter-ROI: pass the judged quarter polygon (TableMapper.quarter_poly)
+    as table_poly. The frame is first cropped to the polygon bbox (+ margin
+    + top_extra for the incoming ball), then downscaled to 640px wide, so
+    HSV + contours run on ~1/4 the pixels. Areas are normalised to full-res
+    px (area_full = area_small / scale^2) so sliders survive crop changes.
+
+    Shape has two paths:
+      round  - classic gates (min_circ/min_solidity/min_fill/min_vertices).
+      streak - fast-serve motion blur: circ >= min_circ_streak and
+               minAreaRect aspect <= max_aspect (2-4 typical at 30 FPS),
+               with relaxed solidity/fill/vertices. Round scores higher so
+               slow balls still prefer the strict path.
+    Tune V thresholds for your hall lighting. Works best with dark background.
+    """
+    if frame_bgr is None:
+        return None, None
+    if frame_bgr.ndim == 2:
+        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
+
+    ox, oy = 0, 0
+    crop = frame_bgr
+    poly_local = None
+    if table_poly is not None:
+        p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+        if len(p) >= 3:
+            x0, y0, x1, y1, _ox, _oy = crop_for_poly(frame_bgr.shape, p,
+                                                      margin=int(roi_margin))
+            # Even-align the bbox exactly like the NV21 ROI path, so both
+            # paths share one scale/prev_small shape and the motion gate
+            # stays valid when tick() alternates between them.
+            fh, fw = frame_bgr.shape[:2]
+            a = _align_roi_for_nv21(x0, y0, x1, y1, fw, fh)
+            if a is None:
+                return None, prev_small
+            x0, y0, x1, y1 = a
+            ox, oy = x0, y0
+            crop = frame_bgr[y0:y1, x0:x1]
+            if crop.size == 0:
+                return None, prev_small
+            poly_local = p - np.array([ox, oy], dtype=np.float32)
+
+    small, scale = _resize_small(crop)
+    h, w = small.shape[:2]
+    # Motion FIRST (c): gray + absdiff before any HSV work. Static frames
+    # with no active track skip HSV/threshold/contours entirely.
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    roi = _build_roi_mask(h, w, poly_local, scale, int(roi_margin))
+    mot = _motion_mask(gray, prev_small, int(motion_thresh))
+    if (mot is not None and last_pos is None):
+        gated = cv2.bitwise_and(mot, roi) if roi is not None else mot
+        # ~0.15% of ROI pixels moving (~150 small-px): ball motion always
+        # exceeds this; sensor noise / AE wobble does not.
+        need = max(30, int(0.0015 * h * w))
+        if int(cv2.countNonZero(gated)) < need:
+            return None, gray
+    # else: active track (last_pos set) -> always run full pipeline so a
+    # slow/hanging ball near the track is never skipped; first frame /
+    # bbox changed (mot None) -> run full pipeline to acquire.
+
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+
+    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
+                        np.array([180, white_s_max, 255]))
+    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
+    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
+    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+
+    if roi is not None:
+        mask = cv2.bitwise_and(mask, roi)
+
+    if mot is not None:
+        mask = cv2.bitwise_and(mask, mot)
+    # else: first frame / bbox changed -> skip motion gate so track can acquire
+
+    best = _score_mask_contours(mask, scale, ox, oy, last_pos,
+                                min_area, max_area, min_circ, min_solidity,
+                                min_fill, min_vertices,
+                                min_circ_streak, max_aspect)
+    return best, gray
+
+
+def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
+                     prev_small=None,
+                     min_area=160.0, max_area=4800.0, min_circ=0.65,
+                     min_solidity=0.85, min_fill=0.70, min_vertices=6,
+                     min_circ_streak=0.35, max_aspect=4.0,
+                     roi_margin=40, motion_thresh=25, white_v_min=150,
+                     white_s_max=60):
+    """ROI-first NV21 detector: Y-plane motion check before any BGR decode.
+
+    (b)+(c) combined: the ROI gray comes straight from the NV21 luma plane
+    (no full-frame BGR decode). Static frames with no active track return
+    (None, gray) without decoding colour at all; moving frames decode only
+    the ROI bbox to BGR for HSV/contours. Detections are in the same
+    full-res coords as detect_ball_hsv.
+
+    nv21: uint8 array shaped (h + h//2, w). Falls back to (None, prev_small)
+    if the ROI is degenerate.
+    """
+    if nv21 is None:
+        return None, prev_small
+    if table_poly is None:
+        return None, prev_small
+    p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
+    if len(p) < 3:
+        return None, prev_small
+    x0, y0, x1, y1, _ox, _oy = crop_for_poly((h, w), p,
+                                             margin=int(roi_margin))
+    gray, scale, ox, oy = y_gray_small_from_nv21(nv21, w, h, x0, y0, x1,
+                                                 y1, width=640)
+    if gray is None:
+        return None, prev_small
+    gh, gw = gray.shape[:2]
+    poly_local = p - np.array([ox, oy], dtype=np.float32)
+    roi = _build_roi_mask(gh, gw, poly_local, scale, int(roi_margin))
+    mot = _motion_mask(gray, prev_small, int(motion_thresh))
+    if mot is not None and last_pos is None:
+        gated = cv2.bitwise_and(mot, roi) if roi is not None else mot
+        need = max(30, int(0.0015 * gh * gw))
+        if int(cv2.countNonZero(gated)) < need:
+            return None, gray
+    roi_bgr, ox2, oy2 = decode_nv21_roi(nv21, w, h, x0, y0, x1, y1)
+    if roi_bgr is None:
+        return None, gray
+    # Resize with the SAME scale as the Y path so HSV geometry matches the
+    # motion gate exactly (avoids a 2nd scale computation drifting by 1px).
+    if scale >= 1.0:
+        small = roi_bgr
+    else:
+        rh, rw = roi_bgr.shape[:2]
+        small = cv2.resize(roi_bgr, (max(int(rw * scale), 1),
+                                     max(int(rh * scale), 1)))
+    sh, sw = small.shape[:2]
+    if (sh, sw) != (gh, gw):
+        # 1px rounding drift between Y and BGR resizes (odd ROI dims):
+        # rebuild masks at colour size; motion gate is skipped this frame
+        # rather than comparing mismatched shapes.
+        roi = _build_roi_mask(sh, sw, poly_local, scale, int(roi_margin))
+        mot = None
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, np.array([0, 0, white_v_min]),
+                        np.array([180, white_s_max, 255]))
+    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
+    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
+    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    if roi is not None:
+        mask = cv2.bitwise_and(mask, roi)
+    if mot is not None:
+        mask = cv2.bitwise_and(mask, mot)
+    best = _score_mask_contours(mask, scale, ox, oy, last_pos,
+                                min_area, max_area, min_circ, min_solidity,
+                                min_fill, min_vertices,
+                                min_circ_streak, max_aspect)
     return best, gray
 
 
@@ -457,13 +678,10 @@ class BallTracker:
 class ServeCaller:
     """State machine: IDLE -> SERVE_LIVE -> DECIDED. Call reset() per serve.
 
-    No modes, no quarter selection: both phones tap positionally from their
-    own end, so MY quarter is always the tap-1 warp slot ("server_right").
-    The first bounce seen inside the quarter-cropped track is judged:
-    inside my quad (+line pad, centre/net lines count IN) -> IN, anything
-    else (wrong half or off table) -> FAULT. Cross-half bounces never enter
-    the cropped track, so no ignore-other-half logic is needed. `want` is
-    kept (default "server_right") only so tests can probe other quads.
+    IN-only: confirms IN when a bounce lands inside MY quarter
+    (+line pad, centre/net lines count IN). Anything else stays silent
+    (no FAULT verdict) — keep watching. `want` defaults to "server_right"
+    (the tap-1 warp slot = MY quarter on every phone).
     """
 
     QUADRANTS = ("server_right", "server_left",
@@ -483,7 +701,7 @@ class ServeCaller:
         self.traj = deque(maxlen=12)
         self.bounces = []  # list of (x, y, quadrant)
         self.state = "IDLE"
-        self.verdict = None  # "IN" | "FAULT" | None
+        self.verdict = None  # "IN" | None (IN-only: no FAULT verdict)
         self.reason = ""
 
     def _bounce_point(self):
@@ -524,7 +742,7 @@ class ServeCaller:
         self.reason = "watching serve..."
 
     def update(self, ball_xy_or_none):
-        """Feed one frame's ball centre (x, y) or None. Returns verdict or None."""
+        """Feed one frame's ball centre (x, y) or None. Returns "IN" or None."""
         if self.state != "SERVE_LIVE":
             return self.verdict
         if ball_xy_or_none is not None:
@@ -549,22 +767,17 @@ class ServeCaller:
         self._judge_single(self.want)
 
     def _judge_single(self, want):
-        # Quarter check in table space (+line pad) is the verdict; the
-        # quadrant string is kept for the on-screen label/debounce.
+        # IN-only: inside my quad (+line pad) -> IN, else stay silent and
+        # keep watching. Outside/off-table bounces never decide.
         mx, my, _q = self.bounces[-1]
         try:
             tx, ty = self.table.to_table(mx, my)
             inside = self._inside_wanted(tx, ty)
         except Exception:
             inside = False
-        q = self.bounces[-1][2]
-        if q == "off_table":
-            self.verdict, self.state = "FAULT", "DECIDED"
-            self.reason = "bounce off table: FAULT"
-            return
         if inside:
             self.verdict, self.state = "IN", "DECIDED"
             self.reason = "bounce in my quarter: IN"
         else:
-            self.verdict, self.state = "FAULT", "DECIDED"
-            self.reason = "bounce outside my quarter: FAULT"
+            self.verdict = None
+            self.reason = "watching serve..."
