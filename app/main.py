@@ -356,7 +356,12 @@ class ServeApp(App):
             from kivy.core.camera import Camera as CoreCamera
             self.cam = CoreCamera(index=0, resolution=(1280, 720))
             self.cam.start()
-            self._lock_exposure()
+            # Do NOT lock exposure here: AE has not converged yet, so
+            # locking now freezes the dark boot frame (black room, only
+            # lights visible). Let Android auto-expose first, then apply
+            # a brightness-safe stabilization (no AE/AWB lock, EC=0,
+            # flexible FPS range) once it has adapted.
+            Clock.schedule_once(lambda dt: self._lock_exposure(), 3.0)
             ok, msg = self._ensure_focus()
             Logger.info(f"PPLineCaller: initial focus: {msg}")
             # Warm the TTS engine now (background thread) so the first
@@ -366,44 +371,42 @@ class ServeApp(App):
             self.status.text = f"Camera error: {e}"
 
     def _lock_exposure(self):
-        """pyjnius experiment: shorten shutter to freeze the 30 FPS streak.
+        """Brightness-safe preview stabilization (delayed, best-effort).
 
-        At 30 FPS auto-exposure holds the shutter open ~1/30s, smearing a
-        50 km/h serve into a faint streak. Forcing a short exposure keeps
-        the frame rate at 30 FPS but sharpens the blob/ellipse. Old Camera
-        API has no direct shutter-time call, so we: lock AE + white balance,
-        nudge exposure-compensation down, and request the fastest preview
-        FPS range the device reports. (Focus is handled separately in
-        _ensure_focus: always continuous AF.) All best-effort: any failure
-        only logs. Compensate darkness with strong hall lighting (preferred)
-        or lower white_v_min via TUNING.
+        Why the old version made the room black: it ran immediately after
+        start() (AE not yet converged) + setAutoExposureLock(True) froze
+        that dark boot frame + EC=-1 darkened it further + forcing a fixed
+        [30000,30000] FPS range forbade the driver from dropping to 15 FPS
+        to gather light in a dim hall.
+
+        New behaviour (safe default):
+          * NEVER locks AE / AWB — Android keeps managing brightness.
+          * Resets exposure compensation to 0 (was -1).
+          * Requests a FLEXIBLE FPS range: among ranges with the highest
+            max (usually 30000 = 30fps) pick the one with the LOWEST min
+            (e.g. [15000,30000] over [30000,30000]) so bright light still
+            gets 30 FPS but dim light may drop FPS to stay bright.
+            If no flexible range exists, FPS is left untouched.
+        (Focus is handled separately in _ensure_focus.) Any failure only
+        logs. If the image is still too dark, leave this disabled entirely
+        (Option A: don't schedule it) and lower white_v_min via TUNING.
         """
         if self._exposure_locked:
             return
         try:
             cam = getattr(self.cam, "_android_camera", None)
             if cam is None:
-                Logger.info("PPLineCaller: no _android_camera, skip exposure lock")
+                Logger.info("PPLineCaller: no _android_camera, skip exposure stabilize")
                 return
             params = cam.getParameters()
             info = []
-            try:
-                if hasattr(params, "setAutoExposureLock"):
-                    params.setAutoExposureLock(True)
-                    info.append("ae-lock")
-            except Exception as e:
-                info.append(f"ae-lock-fail:{e}")
-            try:
-                if hasattr(params, "setAutoWhiteBalanceLock"):
-                    params.setAutoWhiteBalanceLock(True)
-                    info.append("awb-lock")
-            except Exception as e:
-                info.append(f"awb-lock-fail:{e}")
+            # Intentionally no setAutoExposureLock(True) /
+            # setAutoWhiteBalanceLock(True): locking freezes brightness
+            # and causes the black-room symptom.
             try:
                 lo, hi = params.getMinExposureCompensation(), params.getMaxExposureCompensation()
-                # bias one step dark to shorten effective shutter on devices
-                # where EC couples to exposure time; never below minimum.
-                target = max(lo, min(hi, -1 if lo < 0 else lo))
+                # neutral exposure: was -1 (darkens ~1/3-1/2 stop).
+                target = max(lo, min(hi, 0))
                 params.setExposureCompensation(target)
                 info.append(f"ec={target}[{lo},{hi}]")
             except Exception as e:
@@ -411,10 +414,21 @@ class ServeApp(App):
             try:
                 ranges = params.getSupportedPreviewFpsRange()
                 if ranges:
-                    # pick the range with the highest max (usually 30000 = 30fps)
-                    best = max([(r[0], r[1]) for r in ranges], key=lambda r: r[1])
-                    params.setPreviewFpsRange(best[0], best[1])
-                    info.append(f"fps={best}")
+                    parsed = [(r[0], r[1]) for r in ranges]
+                    top_max = max(r[1] for r in parsed)
+                    cands = [r for r in parsed if r[1] == top_max]
+                    # lowest min among the fastest-max ranges: keeps 30fps
+                    # available without forbidding low-light FPS drop.
+                    best = min(cands, key=lambda r: r[0])
+                    if best[0] == best[1]:
+                        # only a fixed high-FPS range exists -> setting it
+                        # would force darkness in dim rooms, so skip it.
+                        info.append(f"fps-skip-fixed{best}")
+                    else:
+                        params.setPreviewFpsRange(best[0], best[1])
+                        info.append(f"fps={best}")
+                else:
+                    info.append("fps-none")
             except Exception as e:
                 info.append(f"fps-fail:{e}")
             try:
@@ -422,9 +436,9 @@ class ServeApp(App):
                 self._exposure_locked = True
             except Exception as e:
                 info.append(f"apply-fail:{e}")
-            Logger.info("PPLineCaller: exposure experiment: " + " ".join(info))
+            Logger.info("PPLineCaller: exposure stabilize: " + " ".join(info))
         except Exception as e:
-            Logger.info(f"PPLineCaller: exposure experiment skipped: {e}")
+            Logger.info(f"PPLineCaller: exposure stabilize skipped: {e}")
 
     def _ensure_focus(self):
         """Lock focus once at startup. Returns (ok, msg).
