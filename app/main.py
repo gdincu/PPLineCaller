@@ -32,7 +32,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.metrics import dp
 
-from serve_caller import (TableMapper, ServeCaller, detect_ball_hsv,
+from serve_caller import (TableMapper, ServeCaller,
                             detect_ball_nv21, BallTracker,
                             debug_contours_for_frame, AutoTuneCollector,
                             expected_ball_area_range)
@@ -54,7 +54,7 @@ CALIB_SHORT = ("1 NR", "2 NC", "3 FC", "4 FR")
 # detector/tracker/bounce settings. Row format:
 # (param key, label, slider min, slider max, step, value format, is-int).
 TUNE_PARAMS = [
-    ("min_area", "Min area", 20, 1000, 20, "{:.0f}", True),
+    ("min_area", "Min area", 5, 1000, 5, "{:.0f}", True),
     ("max_area", "Max area", 1000, 12000, 100, "{:.0f}", True),
     ("min_circ", "Circularity >=", 0.30, 0.95, 0.01, "{:.2f}", False),
     ("min_circ_streak", "Streak circ >=", 0.10, 0.60, 0.01, "{:.2f}", False),
@@ -143,6 +143,8 @@ class ServeApp(App):
                                    confirm_streak=int(self.params["confirm_streak"]))
         self.frame = None
         self._prev_small = None
+        self._last_camera_buffer = None
+        self._last_detection_time = None
         self._tex = None
         self._said = False
         # perf: EMA of tick cost + render throttle (preview at ~15Hz during
@@ -160,6 +162,7 @@ class ServeApp(App):
         self.assist_mask_preview = False
         self._auto_tune = None  # AutoTuneCollector while collecting
         self._auto_needed = 0
+        self._auto_started = None
 
         root = BoxLayout(orientation="vertical")
         # allow_stretch + keep_ratio: frame fills the widget (letterboxed),
@@ -317,12 +320,20 @@ class ServeApp(App):
         Logger.info(f"PPLineCaller: table preset applied {RECOMMENDED_TABLE_PRESET}")
 
     def start_auto_tune(self, *_):
+        if self.calibrating:
+            self.status.text = "Finish calibration before AUTO TUNE."
+            return
         if self.table.H is None:
             self.status.text = "Calibrate first (4 corners), then AUTO TUNE on empty table."
             return
         if self._auto_tune is not None:
             self.status.text = "Auto-tune already running..."
             return
+        self.caller.reset()
+        self.caller.state = "IDLE"
+        self.tracker.reset()
+        self._prev_small = None
+        self._auto_started = time.perf_counter()
         # Caller must keep the table empty and the phone still while
         # ~45 frames (~1.5s) are collected.
         self._auto_tune = AutoTuneCollector(
@@ -336,12 +347,18 @@ class ServeApp(App):
         collector = self._auto_tune
         self._auto_tune = None
         self._auto_needed = 0
+        self._auto_started = None
         if collector is None or collector.frames < 5:
             self.status.text = "Auto-tune: not enough frames (camera not ready)."
             return
         try:
             suggested, report = collector.suggest()
             Logger.info(f"PPLineCaller: auto-tune report:\n{report}\nframes={collector.frames}")
+            if not suggested:
+                self.status.text = report
+                return
+            self.tracker.reset()
+            self._prev_small = None
             # Apply suggested keys live and move sliders so user sees them
             for k, v in suggested.items():
                 self.params[k] = v
@@ -420,6 +437,9 @@ class ServeApp(App):
 
     # -- calibration ----------------------------------------------------
     def start_calib(self, *_):
+        self._auto_tune = None
+        self._auto_started = None
+        self._auto_needed = 0
         self.calib_pts = []
         self.calibrating = True
         self._prev_small = None  # bbox changes after re-calibration
@@ -482,6 +502,9 @@ class ServeApp(App):
         return False
 
     def start_serve(self, *_):
+        if self._auto_tune is not None:
+            self.status.text = "Wait for AUTO TUNE to finish, then START SERVE."
+            return
         if self.table.H is None:
             self.status.text = "Calibrate first (4 corners in order)."
             return
@@ -671,6 +694,11 @@ class ServeApp(App):
             return None
         if buf is None:
             return None
+        # Kivy grab_frame returns the cached preview buffer. Repeated clock
+        # ticks on a slower camera must not count as observations or tune samples.
+        if buf == self._last_camera_buffer:
+            return None
+        self._last_camera_buffer = buf
         try:
             w, h = self._preview_size()
             n = w * (h + h // 2)
@@ -725,6 +753,8 @@ class ServeApp(App):
 
     def tick(self, _dt):
         t0 = time.perf_counter()
+        if self._auto_tune is not None and t0 - self._auto_started > 6.0:
+            self._finish_auto_tune()
         raw = self._grab_nv21()
         if raw is None:
             return
@@ -735,7 +765,7 @@ class ServeApp(App):
             frame_at = self._decode_full_nv21(nv21, w, h, _buf)
             if frame_at is not None:
                 self.frame = frame_at
-                self._auto_tune.add(frame_at)
+                self._auto_tune.add(frame_at, luma=nv21[:h])
                 n = self._auto_tune.frames
                 self.status.text = f"AUTO TUNE: keep still... {n}/{self._auto_needed} frames"
                 # small progress bar
@@ -787,30 +817,24 @@ class ServeApp(App):
                 white_v_min=int(p["white_v_min"]),
                 white_s_max=int(p["white_s_max"]))
             frame = None
-            # Anticipate the render throttle: non-live states and every
-            # Nth live tick need a full frame; other live ticks run ROI-only.
-            want_full = (self.caller.state != "SERVE_LIVE"
-                         or (self._tick_count % self._render_every == 0))
-            if qpoly is None:
-                want_full = True
-            if want_full:
-                frame = self._decode_full_nv21(nv21, w, h, _buf)
-                if frame is None:
-                    return
-                self.frame = frame
-                det, curr_small = detect_ball_hsv(
-                    frame, self.tracker.pos, table_poly=qpoly,
-                    prev_small=self._prev_small, **det_kwargs)
-            else:
-                det, curr_small = detect_ball_nv21(
-                    nv21, w, h, self.tracker.pos, table_poly=qpoly,
-                    prev_small=self._prev_small, **det_kwargs)
+            # Always detect from raw Y + ROI colour. Rendering must not alternate
+            # the motion reference between limited-range Y and BGR grayscale.
+            if (self._last_detection_time is not None
+                    and t0 - self._last_detection_time > 0.20):
+                self.tracker.reset()
+                self._prev_small = None
+            self._last_detection_time = t0
+            det, curr_small = detect_ball_nv21(
+                nv21, w, h, self.tracker.pos, table_poly=qpoly,
+                prev_small=self._prev_small, **det_kwargs)
             if curr_small is not None:
                 self._prev_small = curr_small
             pos = self.tracker.update((det[0], det[1]) if det else None)
             # no detection (coasting): fall back to a small radius
             r_draw = int(det[2]) if det else 6
-            verdict = self.caller.update(pos)
+            verdict = self.caller.update(
+                pos if self.tracker.observed else None,
+                timestamp=t0, track_id=self.tracker.track_id)
             if verdict == "IN":
                 self.status.text = f"IN: {self.caller.reason}"
                 if not self._said:

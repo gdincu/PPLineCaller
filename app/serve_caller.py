@@ -26,6 +26,7 @@ i.e. MY quarter on every phone. They are kept so geometry code stays
 unchanged; user-facing strings say "my quarter" instead.
 """
 from collections import deque
+from functools import lru_cache
 import cv2
 import numpy as np
 
@@ -179,20 +180,33 @@ def small_gray(frame_bgr, width=640):
 
 
 def _build_roi_mask(h, w, poly_local, scale, roi_margin):
-    """Small-res ROI mask for a crop, or None if no polygon."""
+    """Reuse bounded immutable masks while calibration/crop stays unchanged."""
     if poly_local is None:
         return None
+    polygon = tuple(float(v) for v in np.asarray(poly_local).reshape(-1))
+    return _cached_roi_mask(h, w, polygon, scale, roi_margin)
+
+
+@lru_cache(maxsize=4)
+def _cached_roi_mask(h, w, polygon, scale, roi_margin):
     roi = np.zeros((h, w), dtype=np.uint8)
-    pts = (np.asarray(poly_local, dtype=np.float32) * scale).astype(np.int32)
+    pts = (np.asarray(polygon, dtype=np.float32).reshape(-1, 2) * scale).astype(np.int32)
     if len(pts) < 3:
         return None
     cv2.fillPoly(roi, [pts], 255)
     if roi_margin > 0:
         # dilate in small-px: roi_margin was full-res, convert
-        k = max(int(float(roi_margin) * scale), 1)
+        k = max(2 * int(float(roi_margin) * scale) + 1, 1)
         # cap kernel so a big margin can't swallow the whole crop
         k = min(k, min(h, w) // 2 or 1)
         roi = cv2.dilate(roi, np.ones((k, k), np.uint8))
+    # The crop includes 100 full-res pixels above the table, but a symmetric
+    # polygon dilation used to mask that approach corridor straight back out.
+    lift = min(int(round(100 * scale)), h - 1)
+    if lift > 0:
+        roi = cv2.dilate(roi, np.ones((lift + 1, 1), np.uint8),
+                         anchor=(0, 0))
+    roi.setflags(write=False)
     return roi
 
 
@@ -220,7 +234,7 @@ def _ball_mask(hsv, white_v_min, white_s_max):
 def _score_mask_contours(mask, scale, ox, oy, last_pos,
                          min_area, max_area, min_circ, min_solidity,
                          min_fill, min_vertices,
-                         min_circ_streak, max_aspect):
+                         min_circ_streak, max_aspect, motion_mask=None):
     """Shared contour scoring for BGR and NV21-ROI paths. Returns best det."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
@@ -231,6 +245,18 @@ def _score_mask_contours(mask, scale, ox, oy, last_pos,
         area_full = area_small * inv_scale2
         if area_full < min_area or area_full > max_area:
             continue
+        if motion_mask is not None:
+            # Test motion overlap on the complete colour component. A pixel
+            # intersection clips a slow/contact ball into a rejected crescent.
+            # Do this after area filtering to avoid a full-frame label pass.
+            x, y, w, h = cv2.boundingRect(c)
+            local = np.zeros((h, w), dtype=np.uint8)
+            shifted = c - np.array([x, y], dtype=np.int32)
+            cv2.drawContours(local, [shifted], -1, 255, -1)
+            overlap = cv2.countNonZero(cv2.bitwise_and(
+                local, motion_mask[y:y+h, x:x+w]))
+            if overlap < max(2, cv2.countNonZero(local) * 0.02):
+                continue
         peri = cv2.arcLength(c, True)
         if peri < 1:
             continue
@@ -284,8 +310,8 @@ def _align_roi_for_nv21(x0, y0, x1, y1, w, h):
     """
     x0a = max((int(x0) // 2) * 2, 0)
     x1a = min(((int(x1) + 1) // 2) * 2, w)
-    y0a = max(int(y0), 0)
-    y1a = min(int(y1), h)
+    y0a = max((int(y0) // 2) * 2, 0)
+    y1a = min(((int(y1) + 1) // 2) * 2, h)
     if y1a - y0a >= 2 and (y1a - y0a) % 2 == 1:
         y1a -= 1  # shrink by one row to keep height even (keeps y0)
     if x1a - x0a < 4 or y1a - y0a < 4:
@@ -403,9 +429,9 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     mot = _motion_mask(gray, prev_small, int(motion_thresh))
     if (mot is not None and last_pos is None):
         gated = cv2.bitwise_and(mot, roi) if roi is not None else mot
-        # 0.15% of ROI pixels moving: ball motion always exceeds this;
-        # sensor noise / AE wobble does not.
-        need = max(30, int(0.0015 * h * w))
+        # Scale the early-out to the smallest accepted ball, not the whole
+        # crop area (which used to suppress distant balls in wide views).
+        need = max(6, min(30, int(min_area * scale * scale * 0.25)))
         if int(cv2.countNonZero(gated)) < need:
             return None, gray
     # else: active track (last_pos set) -> always run full pipeline so a
@@ -418,14 +444,12 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
 
-    if mot is not None:
-        mask = cv2.bitwise_and(mask, mot)
-    # else: first frame / bbox changed -> skip motion gate so track can acquire
+    # No motion reference on first frame / new crop: allow acquisition.
 
     best = _score_mask_contours(mask, scale, ox, oy, last_pos,
                                 min_area, max_area, min_circ, min_solidity,
                                 min_fill, min_vertices,
-                                min_circ_streak, max_aspect)
+                                min_circ_streak, max_aspect, mot)
     return best, gray
 
 
@@ -465,7 +489,7 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
     mot = _motion_mask(gray, prev_small, int(motion_thresh))
     if mot is not None and last_pos is None:
         gated = cv2.bitwise_and(mot, roi) if roi is not None else mot
-        need = max(30, int(0.0015 * gh * gw))
+        need = max(6, min(30, int(min_area * scale * scale * 0.25)))
         if int(cv2.countNonZero(gated)) < need:
             return None, gray
     roi_bgr, ox2, oy2 = decode_nv21_roi(nv21, w, h, x0, y0, x1, y1)
@@ -490,82 +514,30 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
     mask = _ball_mask(hsv, white_v_min, white_s_max)
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
-    if mot is not None:
-        mask = cv2.bitwise_and(mask, mot)
     best = _score_mask_contours(mask, scale, ox, oy, last_pos,
                                 min_area, max_area, min_circ, min_solidity,
                                 min_fill, min_vertices,
-                                min_circ_streak, max_aspect)
+                                min_circ_streak, max_aspect, mot)
     return best, gray
 
 
 def expected_ball_area_range(table_poly, frame_shape):
-    """Estimate ball area range (full-res px^2) from table geometry.
+    """Conservative full-pixel ball areas from calibrated near/far widths.
 
-    Uses the quarter polygon size vs real quarter (762.5mm × 1370mm, ball
-    40mm) to predict near/far ball diameters in image pixels.  Far is
-    ~0.70× near due to perspective foreshortening at typical phone height.
-    Returns (min_far_area, max_near_area) or (60, 600) fallback if geometry
-    is degenerate.
+    Corner order is near-right, near-centre, far-centre, far-right. Using
+    actual edges avoids the old bbox and fixed 0.70 perspective assumption.
+    A sphere is not planar: these are scale estimates, not measured sizes.
     """
     try:
-        h, w = frame_shape[:2]
-        p = np.asarray(table_poly, dtype=np.float32).reshape(-1, 2)
-        if len(p) < 3:
+        p = np.asarray(table_poly, dtype=np.float32).reshape(4, 2)
+        widths = np.array([np.linalg.norm(p[0] - p[1]),
+                           np.linalg.norm(p[3] - p[2])])
+        if not np.isfinite(widths).all() or widths.min() < 20:
             return 60.0, 600.0
-        # bbox of quarter polygon — approximates quarter width/height in px
-        qw = float(p[:, 0].max() - p[:, 0].min())
-        qh = float(p[:, 1].max() - p[:, 1].min())
-        if qw < 20 or qh < 20:
-            return 60.0, 600.0
-        # real quarter width 762.5mm, ball 40mm => 5.25% of quarter width
-        ratio = 40.0 / 762.5
-        # use width as primary scale; clamp to reasonable 60–90% of bbox
-        # (perspective makes the far edge narrower, so average width is okay)
-        dia_near = qw * ratio
-        # empirical correction: observed bbox includes top_extra, so scale a bit
-        dia_near = float(np.clip(dia_near, 8.0, 40.0))
-        # quarter spans near baseline to net (≈½ table length); perspective
-        # 0.70 matches the ~30% foreshortening seen in the reference Sponeta view
-        dia_far = dia_near * 0.70
-        dia_far = float(np.clip(dia_far, 7.0, 28.0))
-        area_far = np.pi * (dia_far / 2.0) ** 2
-        area_near = np.pi * (dia_near / 2.0) ** 2
-        # widen to 0.7×–1.4× to tolerate focus/lighting
-        return float(area_far * 0.7), float(area_near * 1.4)
-    except Exception:
+        areas = np.pi * (widths * (40.0 / 762.5) / 2.0) ** 2
+        return float(areas.min() * 0.55), float(areas.max() * 1.4)
+    except (TypeError, ValueError):
         return 60.0, 600.0
-
-
-def _hsv_stats_inside_roi(frame_bgr, poly, erode_px=8):
-    """HSV stats sampled strictly inside the quarter polygon.
-
-    Returns dict with v_mean, v_std, v_p95, s_mean, s_median or None if
-    degenerate.
-    """
-    try:
-        h, w = frame_bgr.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2).astype(np.int32)
-        cv2.fillPoly(mask, [pts], 255)
-        if erode_px > 0:
-            k = max(erode_px, 1)
-            mask = cv2.erode(mask, np.ones((k, k), np.uint8))
-        if int(cv2.countNonZero(mask)) < 500:
-            return None
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        vs = hsv[:, :, 2][mask == 255].astype(np.float32)
-        ss = hsv[:, :, 1][mask == 255].astype(np.float32)
-        if vs.size < 100:
-            return None
-        v_mean, v_std = float(vs.mean()), float(vs.std())
-        v_p95 = float(np.percentile(vs, 95))
-        s_mean = float(ss.mean())
-        s_median = float(np.median(ss))
-        return dict(v_mean=v_mean, v_std=v_std, v_p95=v_p95,
-                    s_mean=s_mean, s_median=s_median, count=int(vs.size))
-    except Exception:
-        return None
 
 
 def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
@@ -632,15 +604,17 @@ def debug_contours_for_frame(frame_bgr, table_poly, roi_margin=40,
 
 
 class AutoTuneCollector:
-    """Incremental empty-table analysis for AUTO TUNE.
+    """Bounded, incremental empty-table calibration (no ball ground truth).
 
-    Each frame is reduced to statistics as it arrives (HSV, motion floor,
-    spurious white blobs), so the full burst of BGR frames never has to be
-    stored. `frames` counts accepted samples; `suggest()` returns
-    (suggested_dict, report_str) with conservative heuristics: never a
-    min_area below the geometry-predicted far-ball area, and white
-    thresholds clamped so a dim-light ball is not lost.
+    Ignore camera settling, measure noise in the detector's luma units,
+    and use the dominant table colour instead of highlights. Do not try to
+    eliminate static glare by raising min_area past a distant ball's size.
+    Reject unstable bursts rather than silently applying unreliable values.
     """
+
+    WARMUP = 5
+    MIN_SAMPLES = 20
+    MAX_FRAMES = 60
 
     def __init__(self, table_poly, base_params=None):
         self.table_poly = table_poly
@@ -651,205 +625,146 @@ class AutoTuneCollector:
         self._near_area = 600.0
         self._prev_gray = None
         self._diffs = []
-        self._hsv_stats = []
-        self._noise_areas = []
-        self._max_noise = 0.0
+        self._moving = []
+        self._stats = []
+        self._invalid = False
+        self._masks = None
 
-    def add(self, frame_bgr):
-        """Feed one empty-table frame; per-frame analysis is best-effort."""
-        if frame_bgr is None or self.table_poly is None:
+    def add(self, frame_bgr, luma=None):
+        """Feed a fresh frame; optional raw NV21 Y gives exact live noise units."""
+        if frame_bgr is None or self.table_poly is None or self.frames >= self.MAX_FRAMES:
             return
         if self.frame_shape is None:
             self.frame_shape = frame_bgr.shape
             self._far_area, self._near_area = expected_ball_area_range(
                 self.table_poly, self.frame_shape)
-        self._add_motion(frame_bgr)
-        self._add_hsv(frame_bgr)
-        self._add_noise(frame_bgr)
+        if frame_bgr.shape != self.frame_shape:
+            self._invalid = True
+            return
         self.frames += 1
-
-    def _roi(self, frame_bgr):
+        if self.frames <= self.WARMUP:
+            return
         h, w = frame_bgr.shape[:2]
+        margin = int(self.base_params.get('roi_margin', 40))
         p = np.asarray(self.table_poly, dtype=np.float32).reshape(-1, 2)
-        x0, y0, x1, y1 = crop_for_poly(
-            (h, w), p, margin=int(self.base_params.get("roi_margin", 40)))
-        a = _align_roi_for_nv21(x0, y0, x1, y1, w, h)
-        if a is not None:
-            x0, y0, x1, y1 = a
-        return frame_bgr[y0:y1, x0:x1]
-
-    def _add_motion(self, frame_bgr):
-        try:
-            y_roi = self._roi(frame_bgr)
-            if y_roi.size == 0:
-                return
-            if y_roi.ndim == 3:
-                y_roi = cv2.cvtColor(y_roi, cv2.COLOR_BGR2GRAY)
-            g_small, _sc = _resize_small(y_roi)
-            if g_small.ndim == 3:
-                g_small = cv2.cvtColor(g_small, cv2.COLOR_BGR2GRAY)
-            if self._prev_gray is not None and self._prev_gray.shape == g_small.shape:
-                d = cv2.absdiff(g_small, self._prev_gray)
-                # p97 catches AE wobble / edge noise; the median keeps the
-                # static floor in the sample.
-                self._diffs.append(float(np.percentile(d, 97)))
-                self._diffs.append(float(np.median(d.astype(np.float32))))
-            self._prev_gray = g_small
-        except Exception:
-            pass
-
-    def _add_hsv(self, frame_bgr):
-        try:
-            stats = _hsv_stats_inside_roi(frame_bgr, self.table_poly, erode_px=6)
-            if stats is not None:
-                self._hsv_stats.append(stats)
-        except Exception:
-            pass
-
-    def _add_noise(self, frame_bgr):
-        try:
-            diags, _ = debug_contours_for_frame(
-                frame_bgr, self.table_poly,
-                roi_margin=int(self.base_params.get("roi_margin", 40)),
-                white_v_min=int(self.base_params.get("white_v_min", 150)),
-                white_s_max=int(self.base_params.get("white_s_max", 60)))
-            for d in diags:
-                # blobs up to near_area*1.8 are potential noise (larger
-                # blobs are likely shirts/walls outside the ROI)
-                if d["area"] <= max(self._near_area * 1.8, 1200):
-                    self._noise_areas.append(d["area"])
-                    self._max_noise = max(self._max_noise, d["area"])
-        except Exception:
-            pass
+        bounds = _align_roi_for_nv21(*crop_for_poly((h, w), p, margin), w, h)
+        if bounds is None:
+            self._invalid = True
+            return
+        x0, y0, x1, y1 = bounds
+        small, scale = _resize_small(frame_bgr[y0:y1, x0:x1])
+        sh, sw = small.shape[:2]
+        if self._masks is None:
+            local = p - np.array([x0, y0], dtype=np.float32)
+            table = np.zeros((sh, sw), dtype=np.uint8)
+            cv2.fillPoly(table, [(local * scale).astype(np.int32)], 255)
+            table = cv2.erode(table, np.ones((7, 7), np.uint8))
+            detection = _build_roi_mask(sh, sw, local, scale, margin)
+            self._masks = (table > 0, detection > 0)
+        table, detection = self._masks
+        if np.count_nonzero(table) < 100:
+            self._invalid = True
+            return
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        pixels = hsv[table]
+        saturated = pixels[pixels[:, 1] >= 80]
+        # Bright neutral lines/glints do not describe the coloured surface.
+        coloured = len(saturated) >= len(pixels) * 0.5
+        surface = saturated if coloured else pixels
+        self._stats.append(dict(
+            v=float(np.median(surface[:, 2])),
+            s=float(np.median(surface[:, 1])),
+            brightness=float(np.median(pixels[:, 2])),
+            coloured=coloured))
+        if luma is not None:
+            gray, _ = _resize_small(luma[y0:y1, x0:x1])
+        else:
+            # BGR gray is full range; NV21 Y is limited range [16, 235].
+            gray = cv2.convertScaleAbs(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY),
+                                       alpha=219.0 / 255.0, beta=16)
+        if self._prev_gray is not None:
+            diff = cv2.absdiff(gray, self._prev_gray)[detection]
+            self._diffs.append(float(np.percentile(diff, 97)))
+            self._moving.append(float(np.mean(diff > 20)))
+        self._prev_gray = gray
 
     def suggest(self):
-        """Merge accumulated stats into (suggested_dict, report_str)."""
-        if self.frames == 0 or self.frame_shape is None:
-            return {}, "No frames for auto-tune."
-        far_area, near_area = self._far_area, self._near_area
-        # median of the per-frame stats is robust to one outlier frame
-        hsv_stats = None
-        if self._hsv_stats:
-            hsv_stats = dict(
-                v_mean=float(np.median([s["v_mean"] for s in self._hsv_stats])),
-                v_p95=float(np.median([s["v_p95"] for s in self._hsv_stats])),
-                s_median=float(np.median([s["s_median"] for s in self._hsv_stats])))
-        motion_floor = float(np.median(self._diffs)) if self._diffs else None
-        noise_areas, max_noise = self._noise_areas, self._max_noise
-        # p90 noise area is more robust than single max (one glint)
-        p90_noise = float(np.percentile(noise_areas, 90)) if noise_areas else max_noise
-
-        suggested = {}
-        lines = []
-
-        # min_area: noise-driven but clamped to expected ball band
-        if noise_areas:
-            cand = p90_noise * 1.15 + 18
-            # also consider absolute max with smaller multiplier
-            cand = max(cand, max_noise * 1.06 + 10)
-            # keep inside [far*1.02 , near*0.80] so far/net bounce survives
-            low = far_area * 1.02
-            high = max(near_area * 0.80, far_area + 25)
-            high = float(np.clip(high, low + 10, 420))
-            cand = float(np.clip(cand, low, high))
-            # snap to slider step 20
-            cand = int(round(cand / 20.0) * 20)
-            suggested["min_area"] = int(cand)
-            lines.append(f"min_area {self.base_params.get('min_area','?')} -> {cand} "
-                         f"(noise p90 {p90_noise:.0f} max {max_noise:.0f}, "
-                         f"exp far {far_area:.0f} near {near_area:.0f})")
+        """Return safe suggestions or an actionable rejection, with no mutation."""
+        if self._invalid:
+            return {}, 'Auto-tune rejected: camera size or calibration changed. Recalibrate and retry.'
+        if len(self._stats) < self.MIN_SAMPLES:
+            return {}, 'Auto-tune rejected: not enough fresh samples. Check camera and retry.'
+        brightness = [s['brightness'] for s in self._stats]
+        spread = float(np.percentile(brightness, 90) - np.percentile(brightness, 10))
+        moving = float(np.mean(np.asarray(self._moving) > 0.08)) if self._moving else 0.0
+        floor = float(np.percentile(self._diffs, 90)) if self._diffs else 0.0
+        if spread > 18 or moving > 0.2 or floor > 30:
+            return {}, ('Auto-tune rejected: exposure or scene is unstable. Keep table empty, '
+                        'phone still, let exposure settle, then retry. '
+                        f'(brightness spread {spread:.1f}, motion p97 {floor:.1f})')
+        # Lower, never above, the expected far-ball band. No upward rounding
+        # to 20px steps: that used to discard small far/net balls entirely.
+        area = int(np.clip(np.floor(self._far_area * 0.65 / 5) * 5, 5, 1000))
+        motion = int(np.clip(np.ceil(floor + 3), 5, 35))
+        suggested = dict(min_area=area, motion_thresh=motion)
+        lines = [f'min_area -> {area} (expected far/near {self._far_area:.1f}/{self._near_area:.1f})',
+                 f'motion_thresh -> {motion} (temporal p90 of spatial p97 {floor:.1f})']
+        coloured = np.mean([s['coloured'] for s in self._stats]) >= 0.8
+        if coloured:
+            v = float(np.median([s['v'] for s in self._stats]))
+            sat = float(np.median([s['s'] for s in self._stats]))
+            suggested['white_v_min'] = int(np.clip(round(v + 20), 80, 200))
+            suggested['white_s_max'] = int(np.clip(round(sat * 0.45), 60, 100))
+            lines.append(f'white V/S -> {suggested["white_v_min"]}/{suggested["white_s_max"]} '
+                         f'(dominant table V/S {v:.1f}/{sat:.1f})')
         else:
-            # no white blobs on empty table — trust geometry
-            geom = int(round(max(far_area * 1.10, 120) / 20) * 20)
-            geom = int(np.clip(geom, 80, 320))
-            suggested["min_area"] = geom
-            lines.append(f"min_area -> {geom} (no noise, geometry far {far_area:.0f})")
+            lines.append('White gates unchanged: neutral surface cannot establish ball contrast.')
+        lines.append('ROI, tracking and bounce gates unchanged: empty frames cannot calibrate ball dynamics.')
+        lines.append('Static glare is handled by motion; verify with a ball in ASSIST, especially in dim light.')
+        return suggested, 'Auto-tune suggestions:\n  ' + '\n  '.join(lines)
 
-        # motion_thresh: noise floor + margin, clamped for dim vs bright halls
-        if motion_floor is not None:
-            cand_m = int(round(float(np.clip(motion_floor * 1.9 + 9, 12, 55))))
-            # bright/concrete halls have higher floor; cap so slow ball not lost
-            suggested["motion_thresh"] = cand_m
-            lines.append(f"motion_thresh -> {cand_m} (floor p97 ~{motion_floor:.1f})")
-        else:
-            lines.append("motion_thresh unchanged (insufficient frames)")
 
-        # white_v_min: table V p95 + offset, so concrete glare / table shine
-        # does not become a white blob; ball is ~20-50 V brighter than table blue
-        if hsv_stats is not None:
-            v_p95 = hsv_stats["v_p95"]
-            v_mean = hsv_stats["v_mean"]
-            # table blue V ~ 110-180 indoor; white ball ~ 210-255
-            cand_v = int(round(np.clip(v_p95 + 18, 125, 210)))
-            # very bright halls p95 ~200 -> 210 max; dim halls p95 ~120 ->
-            # cand ~138, but the 135 floor keeps a dim-light ball visible
-            cand_v = max(cand_v, 135)
-            suggested["white_v_min"] = cand_v
-            lines.append(f"white_v_min -> {cand_v} (table V mean {v_mean:.0f} p95 {v_p95:.0f})")
-            # white_s_max: table blue is saturated (~140), white is <50.
-            # Set between them: ~ 45-65 depending on table blue.
-            s_med = hsv_stats["s_median"]
-            cand_s = int(round(np.clip(s_med * 0.42, 35, 75)))
-            # hall with grey concrete (low S) may pull median down; clamp low
-            cand_s = int(np.clip(cand_s, 40, 70))
-            suggested["white_s_max"] = cand_s
-            lines.append(f"white_s_max -> {cand_s} (table S median {s_med:.0f})")
-        else:
-            lines.append("white thresholds unchanged (no HSV stats)")
+def bounce_vertex(traj, min_drop=3.0, min_rise=3.0):
+    """Recent observed descent -> contact/plateau -> ascent in image y.
 
-        # roi_margin: if table fills the frame tightly, a large margin
-        # drags in floor/wall false positives (concrete, legs).  If the
-        # quarter polygon already touches the frame edge, shrink margin.
-        try:
-            h, w = self.frame_shape[:2]
-            p = np.asarray(self.table_poly, dtype=np.float32).reshape(-1, 2)
-            bbox_w = float(p[:, 0].max() - p[:, 0].min())
-            # if quarter occupies >45% of frame width, margin is risky
-            frac = bbox_w / max(w, 1)
-            if frac > 0.48 and int(self.base_params.get("roi_margin", 40)) > 30:
-                suggested["roi_margin"] = 28
-                lines.append(f"roi_margin  -> 28 (quarter {frac*100:.0f}% of frame, tight crop)")
-        except Exception:
-            pass
-
-        report = "Auto-tune suggestions:\n" + "\n".join("  " + l for l in lines)
-        report += f"\nGeometry expects ball area ~{far_area:.0f}–{near_area:.0f} full-px."
-        if noise_areas:
-            report += f"  Empty-table noise up to {max_noise:.0f} px."
-        return suggested, report
+    Return the observed contact vertex (plateau midpoint), or None. A short
+    window accumulates shallow motion instead of demanding two adjacent
+    >3px steps. Significant reversals on either leg reject jitter/old arcs.
+    No future samples are needed after the rise reaches its threshold.
+    """
+    points = list(traj)[-8:]
+    if len(points) < 3:
+        return None
+    ys = np.array([p[1] for p in points], dtype=float)
+    peak = float(np.max(ys[:-1]))
+    tolerance = min(0.75, min_drop * 0.25, min_rise * 0.25)
+    contact = np.flatnonzero(peak - ys[:-1] <= tolerance)
+    first, last = int(contact[0]), int(contact[-1])
+    if (first == 0 or len(points) - first > 5
+            or np.any(peak - ys[first:last + 1] > tolerance)):
+        return None
+    drop = peak - float(np.min(ys[:first]))
+    rise = peak - ys[-1]
+    if drop < min_drop or rise < min_rise:
+        return None
+    if (np.any(np.diff(ys[:first + 1]) < -tolerance)
+            or np.any(np.diff(ys[last:]) > tolerance)):
+        return None
+    a, b = points[first], points[last]
+    return ((float(a[0]) + float(b[0])) / 2.0, peak)
 
 
 def is_bounce(traj, min_drop=3.0, min_rise=3.0):
-    """Same idea as the pickleball notebook: dy1>0 then dy2<0 (image y down).
-
-    traj: list of (x, y) camera pixels, most recent last. Need >=3 points.
-    Thresholds reject jitter.
-    """
-    if len(traj) < 3:
-        return False
-    dy1 = traj[-2][1] - traj[-3][1]
-    dy2 = traj[-1][1] - traj[-2][1]
-    return dy1 > min_drop and dy2 < -min_rise
+    return bounce_vertex(traj, min_drop, min_rise) is not None
 
 
 class BallTracker:
-    """Confirmed-track gate between raw detections and serve logic.
+    """Track real detections; coast only for association/display.
 
-    A raw per-frame detection becomes the accepted track position only if
-    it falls within max_jump (full-res px) of the last accepted position; a
-    lost or teleporting track restarts acquisition and needs
-    confirm_streak consecutive gated hits before it feeds the serve logic.
-    The track drops after drop_after_missed frames with no detection. This
-    stops single-frame false positives from injecting phantom points into
-    bounce detection.
-
-    30 FPS retune: a 50 km/h serve jumps ~46 cm/frame (~150 image px), so
-    max_jump defaults to 180 and confirm_streak defaults to 1
-    (a serve is only 3-5 frames; requiring 2 kills fast tracks when the
-    quarter-ROI + motion gate already cut false positives). Up to
-    coast_frames missed frames are bridged with constant-velocity
-    prediction so one dropped detection doesn't split the trajectory and
-    hide the bounce flip.
+    `observed` distinguishes evidence from predictions; `track_id` changes
+    on reacquisition so unrelated tracks cannot form a bounce together.
+    Displacement and velocity are measured from the last real observation,
+    including elapsed missed frames, never from an overshooting coast guess.
     """
 
     def __init__(self, max_jump=180.0, confirm_streak=1, drop_after_missed=7,
@@ -858,16 +773,12 @@ class BallTracker:
         self.confirm_streak = int(confirm_streak)
         self.drop_after_missed = int(drop_after_missed)
         self.coast_frames = int(coast_frames)
-        self.pos = None  # last accepted (x, y) or None
-        self._cand = None
-        self._cand_streak = 0
-        self._missed = 0
-        self._vel = None  # (vx, vy) full-res px/frame
-        self._real = None  # last accepted REAL detection (never a coast guess)
-        self._gap = 0  # frames elapsed since _real (0 when pos is real)
+        self.track_id = 0
+        self.reset()
 
     def reset(self):
         self.pos = None
+        self.observed = False
         self._cand = None
         self._cand_streak = 0
         self._missed = 0
@@ -876,63 +787,48 @@ class BallTracker:
         self._gap = 0
 
     def update(self, det_or_none):
-        """Feed a raw (x, y[, r]) detection or None. Returns accepted (x, y) or None."""
+        self.observed = False
         if det_or_none is None:
             self._missed += 1
-            if (self.pos is not None and self._vel is not None
-                    and self._missed <= self.coast_frames):
-                # coast: predict through 1-2 missed frames so the
-                # dy-flip bounce check still sees a continuous trajectory.
-                vx, vy = self._vel
-                if abs(vx) + abs(vy) <= self.max_jump * 2.0:
-                    self.pos = (self.pos[0] + vx, self.pos[1] + vy)
-                    self._gap += 1
-                    return self.pos
+            self._gap += 1
+            # Confirmation hits must be consecutive.
+            self._cand = None
+            self._cand_streak = 0
             if self._missed > self.drop_after_missed:
                 self.reset()
-            return None
-        self._missed = 0
-        x, y = float(det_or_none[0]), float(det_or_none[1])
-        if self.pos is not None:
-            dx, dy = x - self.pos[0], y - self.pos[1]
-            if np.hypot(dx, dy) <= self.max_jump:
-                self._vel = (dx, dy)
-                self.pos = (x, y)
-                self._real = (x, y)
-                self._gap = 0
+                return None
+            if (self._real is not None and self._vel is not None
+                    and self._missed <= self.coast_frames):
+                vx, vy = self._vel
+                self.pos = (self._real[0] + vx * self._gap,
+                            self._real[1] + vy * self._gap)
                 return self.pos
-            if self._real is not None:
-                # Post-coast correction: if the missed frame straddled the
-                # bounce, the coast guess kept going DOWN while the real ball
-                # came back UP, so the detection lands far from the guess.
-                # Accept it against the last REAL point (wider window) and
-                # recompute per-frame velocity over the gap, instead of
-                # declaring a teleport and restarting the track (which hid
-                # the bounce for 1-2 extra frames).
-                dr = np.hypot(x - self._real[0], y - self._real[1])
-                if dr <= self.max_jump * 1.25:
-                    n = max(self._gap + 1, 1)
-                    self._vel = ((x - self._real[0]) / n, (y - self._real[1]) / n)
-                    self.pos = (x, y)
-                    self._real = (x, y)
-                    self._gap = 0
-                    return self.pos
-            self.pos = None  # teleport: restart acquisition below
-            self._vel = None
-            self._real = None
-            self._gap = 0
+            return None
+        x, y = float(det_or_none[0]), float(det_or_none[1])
+        self._missed = 0
+        if self._real is not None:
+            n = self._gap + 1
+            dr = np.hypot(x - self._real[0], y - self._real[1])
+            if dr <= self.max_jump * min(n, self.coast_frames + 1):
+                self._vel = ((x - self._real[0]) / n, (y - self._real[1]) / n)
+                self.pos = self._real = (x, y)
+                self._gap = 0
+                self.observed = True
+                return self.pos
+            self.reset()
         if (self._cand is not None
                 and np.hypot(x - self._cand[0], y - self._cand[1]) <= self.max_jump):
             self._cand_streak += 1
+            self._vel = (x - self._cand[0], y - self._cand[1])
         else:
-            self._cand = (x, y)
             self._cand_streak = 1
+            self._vel = None
+        self._cand = (x, y)
         if self._cand_streak >= self.confirm_streak:
-            if self._cand_streak > 1:
-                self._vel = (x - self._cand[0], y - self._cand[1])
-            self.pos = (x, y)
-            self._real = (x, y)
+            self.track_id += 1
+            self.pos = self._real = (x, y)
             self._gap = 0
+            self.observed = True
             self._cand = None
             self._cand_streak = 0
             return self.pos
@@ -965,26 +861,22 @@ class ServeCaller:
         self.state = "IDLE"
         self.verdict = None  # "IN" | None (IN-only: no FAULT verdict)
         self.reason = ""
+        self._missed = 0
+        self._last_time = None
+        self._track_id = None
 
     def _bounce_point(self):
-        """Refine the bounce to between-frame position in table space.
+        """Map the observed contact vertex, avoiding the old post-rise midpoint bias.
 
-        At 30 FPS the bounce usually happens *between* frames. The dy-flip
-        fires on (pre, post) samples straddling the bounce, so judging the
-        post point alone biases the call by up to ~23 cm. We take the camera
-        midpoint of traj[-2..-1], map it to table coords, and judge quarter
-        membership there (perspective-correct). Returns
-        (mx, my, tx, ty) or None if uncalibrated.
+        Between-frame contact remains uncertain with one camera. Do not
+        claim an interpolated point on the rising leg is perspective-correct
+        contact: homography is valid only at the table plane.
         """
-        if len(self.traj) < 2 or self.table.H is None:
+        point = bounce_vertex(self.traj, self.min_drop, self.min_rise)
+        if point is None or self.table.H is None:
             return None
-        ax, ay = self.traj[-2][:2]
-        bx, by = self.traj[-1][:2]
-        mx, my = (float(ax) + float(bx)) / 2.0, (float(ay) + float(by)) / 2.0
-        try:
-            tx, ty = self.table.to_table(mx, my)
-        except Exception:
-            return None
+        mx, my = point
+        tx, ty = self.table.to_table(mx, my)
         return mx, my, tx, ty
 
     def _inside_wanted(self, tx, ty):
@@ -1002,27 +894,38 @@ class ServeCaller:
         self.state = "SERVE_LIVE"
         self.verdict = None
         self.reason = "watching serve..."
+        self._missed = 0
+        self._last_time = None
+        self._track_id = None
 
-    def update(self, ball_xy_or_none):
+    def update(self, ball_xy_or_none, timestamp=None, track_id=None):
         """Feed one frame's ball centre (x, y) or None. Returns "IN" or None."""
         if self.state != "SERVE_LIVE":
             return self.verdict
-        if ball_xy_or_none is not None:
-            self.traj.append(ball_xy_or_none)
-            if is_bounce(list(self.traj), self.min_drop, self.min_rise):
-                refined = self._bounce_point()
-                if refined is None:
-                    return self.verdict
-                mx, my, tx, ty = refined
-                q = self.table.quadrant(mx, my)
-                on_table = self.table.inside_table(mx, my)
-                # debounce: ignore same-quadrant double counts within 5 frames
-                if not self.bounces or self.bounces[-1][2] != q or not on_table:
-                    label = q if on_table else "off_table"
-                    self.bounces.append((mx, my, label))
+        if track_id is not None and track_id != self._track_id:
+            self.traj.clear()
+            self._track_id = track_id
+        if timestamp is not None and self._last_time is not None:
+            if timestamp - self._last_time > 0.20 or timestamp <= self._last_time:
                 self.traj.clear()
-                self.traj.append(ball_xy_or_none)
-                self._judge()
+        if ball_xy_or_none is None:
+            self._missed += 1
+            if self._missed > 2:
+                self.traj.clear()
+            return self.verdict
+        self._missed = 0
+        self._last_time = timestamp
+        self.traj.append(ball_xy_or_none)
+        refined = self._bounce_point()
+        if refined is not None:
+            mx, my, tx, ty = refined
+            q = self.table.quadrant(mx, my)
+            label = q if self.table.inside_table(mx, my) else "off_table"
+            self.bounces.append((mx, my, label))
+            # Consume the descending leg so a contact cannot be counted twice.
+            self.traj.clear()
+            self.traj.append(ball_xy_or_none)
+            self._judge()
         return self.verdict
 
     def _judge(self):
