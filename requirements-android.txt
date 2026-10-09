@@ -1,0 +1,3 @@
+# Update deliberately alongside the Android CI checks.
+buildozer==1.6.0
+Cython==0.29.36

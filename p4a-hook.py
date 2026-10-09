@@ -1,4 +1,4 @@
-"""python-for-android hook: 16 KB page-size alignment of native libs.
+"""python-for-android hook: native startup and 16 KB library alignment.
 
 Two parts (patchelf is NOT used - its ELF rewrite breaks JNI symbol
 resolution in SDL2):
@@ -17,9 +17,43 @@ resolution in SDL2):
 
 import glob
 import os
+import re
 import shutil
+from pathlib import Path
 
 _SWAP_LIBS = ("libc++_shared.so", "libomp.so")
+
+_FINISH_LOAD = "            mActivity.finishLoad();"
+_GUARDED_FINISH_LOAD = _FINISH_LOAD + """
+            // PPLineCaller: retain SDL's original native-library error dialog.
+            if (SDLActivity.mBrokenLibraries) {
+                Log.e(TAG, "Native library initialization failed; see the SDL error dialog.");
+                return;
+            }"""
+
+
+def _guard_sdl_startup(dist_dir):
+    """Stop before nativeSetenv if SDL failed to load the native libraries.
+
+    finishLoad() catches loader failures and displays their original message,
+    but p4a's UnpackFilesTask otherwise continues into unresolved JNI calls.
+    Patch the generated Java before Gradle compiles it, including cached dists.
+    """
+    activity = Path(dist_dir) / "src/main/java/org/kivy/android/PythonActivity.java"
+    source = activity.read_text(encoding="utf-8")
+    # Check even a previously patched distribution: a new, unguarded call
+    # must not be hidden by the old guard. Also catch differently spaced calls.
+    calls = re.findall(r"\bfinishLoad\s*\(\s*\)\s*;", source)
+    if len(calls) != 1 or source.count(_FINISH_LOAD) != 1:
+        raise RuntimeError(
+            "Cannot apply SDL startup guard: PythonActivity.finishLoad changed. "
+            "Review the python-for-android bootstrap before building the APK."
+        )
+    if _GUARDED_FINISH_LOAD in source:
+        return
+    activity.write_text(
+        source.replace(_FINISH_LOAD, _GUARDED_FINISH_LOAD), encoding="utf-8"
+    )
 
 
 def _find_newer_ndk_prebuilt_dir():
@@ -60,6 +94,7 @@ def before_apk_build(self):
     dist = getattr(self, "_dist", None)
     if dist is None:
         return
+    _guard_sdl_startup(dist.dist_dir)
     prebuilt = _find_newer_ndk_prebuilt_dir()
     if prebuilt is None:
         return
