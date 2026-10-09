@@ -8,7 +8,6 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -68,12 +67,11 @@ class AndroidStartupTests(unittest.TestCase):
         self.activity.parent.mkdir(parents=True)
         self.activity.write_text(JAVA, encoding="utf-8")
 
-    def test_guard_applies_without_newer_ndk_and_is_idempotent(self):
+    def test_guard_applies_and_is_idempotent(self):
         toolchain = SimpleNamespace(_dist=SimpleNamespace(dist_dir=str(self.dist)))
-        with patch.object(hook, "_find_newer_ndk_prebuilt_dir", return_value=None):
-            hook.before_apk_build(toolchain)
-            first = self.activity.read_text(encoding="utf-8")
-            hook.before_apk_build(toolchain)
+        hook.before_apk_build(toolchain)
+        first = self.activity.read_text(encoding="utf-8")
+        hook.before_apk_build(toolchain)
         self.assertEqual(first, self.activity.read_text(encoding="utf-8"))
         self.assertIn(hook._GUARDED_FINISH_LOAD, first)
 
