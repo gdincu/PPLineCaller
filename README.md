@@ -42,3 +42,6 @@ python tools/validate_detection.py --baseline 66d7bbb
 
 See [investigation and validation notes](docs/detection-validation.md) for root
 causes, comparison results, and remaining device/footage checks.
+
+For crashes during native library loading, see the
+[Android startup investigation](docs/android-startup.md).
