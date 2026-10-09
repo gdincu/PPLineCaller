@@ -80,6 +80,16 @@ truncated headers, reserved gaps, and bundled Python extensions. A small ARM64
 library linked locally with LLD 18 verifies the fixed linker emits
 `.relro_padding`, with both LOAD and RELRO ending at the same page boundary.
 
+The replacement APK from [CI run 37980870082](https://github.com/gdincu/PPLineCaller/actions/runs/37980870082),
+built from fix commit `a867a1b`, passed all build checks and independent
+verification of **152 native libraries**. In the shipped libpng, LOAD and RELRO
+now both end at `0x50000`; WebP demux/mux end at `0x8000`/`0x10000` respectively.
+On a real 4 KB Linux kernel, reserving each libpng's LOAD image and protecting
+its RELRO range reproduces `ENOMEM` for the old APK and succeeds for the new one.
+The rebuilt APK starts Python/Kivy and reaches the application main loop in
+the Android 15 emulator. Installation on the Xiaomi remains the final device
+check.
+
 The regression tests compile and execute a small Java startup harness covering
 both failed and successful loading, plus hook idempotence and upstream drift,
 including additional loading calls in an already-patched distribution.
