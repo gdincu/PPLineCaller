@@ -9,7 +9,8 @@ jobs:
         with: {python-version: '3.11'}
       - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
       - run: pip install "cython==0.29.36" buildozer
-      - run: |
+      - name: Prepare python-for-android with 16 KB alignment
+        run: |
           set -o pipefail
           # Pre-install p4a (buildozer.spec points p4a.source_dir at this
           # checkout) with link flags so every compiled lib is 16 KB-aligned.
@@ -23,25 +24,62 @@ jobs:
           printf 'APP_LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384\n' >> \
             .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
           tail -n 3 .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
-      - run: |
+      - name: Identify native build toolchain
+        id: native-toolchain
+        run: |
+          set -o pipefail
+          # Track the actual versions while buildozer and p4a remain unpinned.
+          {
+            printf '%s\n' "$ImageOS"
+            python -c 'import platform; from importlib.metadata import version; print(platform.python_version()); print(version("buildozer")); print(version("Cython"))'
+            git -C .buildozer/android/platform/python-for-android rev-parse HEAD
+          } > /tmp/buildozer-toolchain.txt
+          cat /tmp/buildozer-toolchain.txt
+          echo "fingerprint=$(sha256sum /tmp/buildozer-toolchain.txt | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache Buildozer native outputs and toolchain
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          # Keep the p4a checkout and app staging fresh. Cache native recipes,
+          # distributions, source downloads, SDK, NDK, and Ant only.
+          path: |
+            .buildozer/android/platform/build-*
+            ~/.buildozer/android/platform
+          # Exact matches only: never reuse native binaries across changed
+          # recipes, ABI/API settings, hooks, or 16 KB alignment patches.
+          key: buildozer-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('buildozer.spec', 'p4a-recipes/**', 'p4a-hook.py', '.github/workflows/build-apk.yml') }}
+      - name: Prepare NDK with 16 KB alignment
+        run: |
           set -o pipefail
           # CMake-built recipes (opencv, jpeg, libwebp) ignore p4a's LDFLAGS and
           # take linker flags from the NDK toolchain files, so pre-install the
           # NDK where buildozer looks for it and patch those files.
           ndk_dir="$HOME/.buildozer/android/platform/android-ndk-r25b"
-          mkdir -p "$(dirname "$ndk_dir")"
-          curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
-          unzip -q /tmp/ndk.zip -d "$(dirname "$ndk_dir")"
-          rm /tmp/ndk.zip
-          sed -i 's|-Wl,--build-id=sha1|-Wl,--build-id=sha1 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384|' \
-            "$ndk_dir"/build/cmake/*.cmake
+          if [ ! -f "$ndk_dir/source.properties" ]; then
+            mkdir -p "$(dirname "$ndk_dir")"
+            curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
+            unzip -q /tmp/ndk.zip -d "$(dirname "$ndk_dir")"
+            rm /tmp/ndk.zip
+            sed -i 's|-Wl,--build-id=sha1|-Wl,--build-id=sha1 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384|' \
+              "$ndk_dir"/build/cmake/*.cmake
+          else
+            echo "Reusing cached, patched NDK: $ndk_dir"
+          fi
           grep -n "max-page-size" "$ndk_dir"/build/cmake/*.cmake
-      - run: |
+      - name: Build debug APK
+        run: |
           set -o pipefail
+          start=$SECONDS
           buildozer android debug 2>&1 | tee buildozer.log
+          elapsed=$((SECONDS - start))
+          printf '### APK build\n\n- Native/toolchain cache hit: %s\n- Buildozer duration: %sm %ss\n' \
+            "${NATIVE_CACHE_HIT:-false}" "$((elapsed / 60))" "$((elapsed % 60))" >> "$GITHUB_STEP_SUMMARY"
         env:
           ACCEPT_SDK_LICENSE: "yes"
-      - run: |
+          NATIVE_CACHE_HIT: ${{ steps.native-cache.outputs.cache-hit }}
+          PYTHONUNBUFFERED: "1"
+      - name: Verify 16 KB native library alignment
+        run: |
           set -o pipefail
           apk=$(ls bin/*.apk | head -n1)
           echo "APK: $apk"
