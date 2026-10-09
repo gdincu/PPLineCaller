@@ -16,6 +16,7 @@ android.ndk = 25b
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = develop
+p4a.commit = f6d8f00bb0980b7e3f601df8703179119cd1b3cb
 p4a.source_dir = .buildozer/android/platform/python-for-android
 p4a.local_recipes = ./p4a-recipes
 p4a.hook = ./p4a-hook.py

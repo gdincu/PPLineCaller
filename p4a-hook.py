@@ -17,6 +17,7 @@ resolution in SDL2):
 
 import glob
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -40,13 +41,16 @@ def _guard_sdl_startup(dist_dir):
     """
     activity = Path(dist_dir) / "src/main/java/org/kivy/android/PythonActivity.java"
     source = activity.read_text(encoding="utf-8")
-    if _GUARDED_FINISH_LOAD in source:
-        return
-    if source.count(_FINISH_LOAD) != 1:
+    # Check even a previously patched distribution: a new, unguarded call
+    # must not be hidden by the old guard. Also catch differently spaced calls.
+    calls = re.findall(r"\bfinishLoad\s*\(\s*\)\s*;", source)
+    if len(calls) != 1 or source.count(_FINISH_LOAD) != 1:
         raise RuntimeError(
             "Cannot apply SDL startup guard: PythonActivity.finishLoad changed. "
             "Review the python-for-android bootstrap before building the APK."
         )
+    if _GUARDED_FINISH_LOAD in source:
+        return
     activity.write_text(
         source.replace(_FINISH_LOAD, _GUARDED_FINISH_LOAD), encoding="utf-8"
     )

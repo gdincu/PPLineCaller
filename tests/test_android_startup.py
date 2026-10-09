@@ -1,6 +1,7 @@
 """Packaging regressions for p4a's SDL native-library startup failure path."""
 
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -84,6 +85,23 @@ class AndroidStartupTests(unittest.TestCase):
                     hook._guard_sdl_startup(self.dist)
                 self.assertEqual(source, self.activity.read_text(encoding="utf-8"))
 
+    def test_cached_guard_does_not_hide_another_load_call(self):
+        hook._guard_sdl_startup(self.dist)
+        guarded = self.activity.read_text(encoding="utf-8")
+        for extra_call in (
+            hook._FINISH_LOAD,
+            "mActivity.finishLoad();",
+            "            mActivity . finishLoad ();",
+            "            this.finishLoad();",
+            "            finishLoad();",
+        ):
+            with self.subTest(extra_call=extra_call):
+                source = guarded + "\n" + extra_call
+                self.activity.write_text(source, encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "finishLoad changed"):
+                    hook._guard_sdl_startup(self.dist)
+                self.assertEqual(source, self.activity.read_text(encoding="utf-8"))
+
     @unittest.skipUnless(shutil.which("javac") and shutil.which("java"), "JDK required")
     def test_failed_load_skips_jni_and_successful_load_continues(self):
         hook._guard_sdl_startup(self.dist)
@@ -95,6 +113,48 @@ class AndroidStartupTests(unittest.TestCase):
             ["java", "-cp", str(self.dist), "PythonActivity"],
             check=True, capture_output=True, text=True,
         )
+
+
+@unittest.skipUnless(os.environ.get("P4A_SOURCE_DIR"), "P4A_SOURCE_DIR required for upstream checks")
+class UpstreamAndroidStartupTests(unittest.TestCase):
+    """Check real Java in CI; the APK job also compiles it through Gradle."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.dist = Path(self.temp.name)
+        relative = Path("src/main/java/org/kivy/android/PythonActivity.java")
+        upstream = (
+            Path(os.environ["P4A_SOURCE_DIR"])
+            / "pythonforandroid/bootstraps/sdl2/build" / relative
+        )
+        self.original = upstream.read_text(encoding="utf-8")
+        self.activity = self.dist / relative
+        self.activity.parent.mkdir(parents=True)
+        self.activity.write_text(self.original, encoding="utf-8")
+        hook._guard_sdl_startup(self.dist)
+        self.guarded = self.activity.read_text(encoding="utf-8")
+
+    def test_guard_applies_to_pinned_upstream_java(self):
+        self.assertEqual(self.guarded.count(hook._GUARDED_FINISH_LOAD), 1)
+        self.assertEqual(
+            self.guarded.replace(hook._GUARDED_FINISH_LOAD, hook._FINISH_LOAD),
+            self.original,
+        )
+        self.assertLess(
+            self.guarded.index(hook._GUARDED_FINISH_LOAD) + len(hook._GUARDED_FINISH_LOAD),
+            self.guarded.index("SDLActivity.nativeSetenv("),
+        )
+        hook._guard_sdl_startup(self.dist)
+        self.assertEqual(self.guarded, self.activity.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(os.environ.get("P4A_DIST_DIR"), "P4A_DIST_DIR required after APK build")
+    def test_compiled_distribution_contains_expected_guard(self):
+        generated = (
+            Path(os.environ["P4A_DIST_DIR"])
+            / "src/main/java/org/kivy/android/PythonActivity.java"
+        )
+        self.assertEqual(generated.read_text(encoding="utf-8"), self.guarded)
 
 
 if __name__ == "__main__":

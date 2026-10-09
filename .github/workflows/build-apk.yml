@@ -8,76 +8,89 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
-      - run: pip install "cython==0.29.36" buildozer
+      - run: python -m pip install -r requirements-android.txt
       - name: Prepare python-for-android with 16 KB alignment
         run: |
           set -o pipefail
           # Pre-install p4a (buildozer.spec points p4a.source_dir at this
           # checkout) with link flags so every compiled lib is 16 KB-aligned.
-          mkdir -p .buildozer/android/platform
-          git clone -b develop --single-branch --depth 1 \
-            https://github.com/kivy/python-for-android.git \
-            .buildozer/android/platform/python-for-android
+          p4a_commit=$(python -c 'import configparser; c = configparser.ConfigParser(); c.read("buildozer.spec"); print(c["app"]["p4a.commit"])')
+          p4a_dir=.buildozer/android/platform/python-for-android
+          mkdir -p "$p4a_dir"
+          git -C "$p4a_dir" init
+          git -C "$p4a_dir" fetch --depth 1 https://github.com/kivy/python-for-android.git "$p4a_commit"
+          git -C "$p4a_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$p4a_dir" rev-parse HEAD)" = "$p4a_commit"
           sed -i "s|^    common_ldflags = \['-L{ctx_libs_dir}'\]|    common_ldflags = ['-L{ctx_libs_dir}', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']|" \
             .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
           grep -n "max-page-size" .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
           printf 'APP_LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384\n' >> \
             .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
           tail -n 3 .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
-      - name: Identify native build toolchain
-        id: native-toolchain
+      - name: Identify Android build toolchain
+        id: android-toolchain
         run: |
-          set -o pipefail
-          # Track the actual versions while buildozer and p4a remain unpinned.
-          {
-            printf '%s\n' "$ImageOS"
-            python -c 'import platform; from importlib.metadata import version; print(platform.python_version()); print(version("buildozer")); print(version("Cython"))'
-            git -C .buildozer/android/platform/python-for-android rev-parse HEAD
-          } > /tmp/buildozer-toolchain.txt
-          cat /tmp/buildozer-toolchain.txt
-          echo "fingerprint=$(sha256sum /tmp/buildozer-toolchain.txt | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
-      - name: Cache Buildozer native outputs and toolchain
+          python - <<'PY'
+          import configparser
+          import hashlib
+          import os
+          import platform
+          from importlib.metadata import version
+
+          config = configparser.ConfigParser()
+          config.read("buildozer.spec")
+          values = [os.environ["ImageOS"], platform.python_version(), version("buildozer"), version("Cython")]
+          for key in ("android.api", "android.minapi", "android.build_tools", "android.ndk"):
+              values.append(f"{key}={config['app'][key]}")
+          fingerprint = "\n".join(values)
+          print(fingerprint)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"fingerprint={hashlib.sha256(fingerprint.encode()).hexdigest()}", file=output)
+              print(f"ndk_revision={config['app']['android.ndk']}", file=output)
+          PY
+      - name: Cache Android SDK, NDK, and Ant
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform
+          # Hooks and recipes can change without downloading the toolchain again.
+          # The NDK patch script is included so changed linker flags cannot be reused.
+          key: buildozer-toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.android-toolchain.outputs.fingerprint }}-${{ hashFiles('requirements-android.txt', 'tools/prepare-android-ndk.sh') }}
+      - name: Cache Buildozer native outputs
         id: native-cache
         uses: actions/cache@v4
         with:
           # Keep the p4a checkout and app staging fresh. Cache native recipes,
-          # distributions, source downloads, SDK, NDK, and Ant only.
-          path: |
-            .buildozer/android/platform/build-*
-            ~/.buildozer/android/platform
+          # distributions, and source downloads only.
+          path: .buildozer/android/platform/build-*
           # Exact matches only: never reuse native binaries across changed
           # recipes, ABI/API settings, hooks, or 16 KB alignment patches.
-          key: buildozer-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-toolchain.outputs.fingerprint }}-${{ hashFiles('buildozer.spec', 'p4a-recipes/**', 'p4a-hook.py', '.github/workflows/build-apk.yml') }}
+          key: buildozer-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.android-toolchain.outputs.fingerprint }}-${{ hashFiles('buildozer.spec', 'requirements-android.txt', 'p4a-recipes/**', 'p4a-hook.py', 'tools/prepare-android-ndk.sh', '.github/workflows/build-apk.yml') }}
       - name: Prepare NDK with 16 KB alignment
         run: |
-          set -o pipefail
           # CMake-built recipes (opencv, jpeg, libwebp) ignore p4a's LDFLAGS and
-          # take linker flags from the NDK toolchain files, so pre-install the
-          # NDK where buildozer looks for it and patch those files.
-          ndk_dir="$HOME/.buildozer/android/platform/android-ndk-r25b"
-          if [ ! -f "$ndk_dir/source.properties" ]; then
-            mkdir -p "$(dirname "$ndk_dir")"
-            curl -sSfL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r25b-linux.zip
-            unzip -q /tmp/ndk.zip -d "$(dirname "$ndk_dir")"
-            rm /tmp/ndk.zip
-            sed -i 's|-Wl,--build-id=sha1|-Wl,--build-id=sha1 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384|' \
-              "$ndk_dir"/build/cmake/*.cmake
-          else
-            echo "Reusing cached, patched NDK: $ndk_dir"
-          fi
-          grep -n "max-page-size" "$ndk_dir"/build/cmake/*.cmake
+          # take linker flags from the NDK toolchain files.
+          bash tools/prepare-android-ndk.sh "$NDK_REVISION"
+        env:
+          NDK_REVISION: ${{ steps.android-toolchain.outputs.ndk_revision }}
       - name: Build debug APK
         run: |
           set -o pipefail
           start=$SECONDS
           buildozer android debug 2>&1 | tee buildozer.log
           elapsed=$((SECONDS - start))
-          printf '### APK build\n\n- Native/toolchain cache hit: %s\n- Buildozer duration: %sm %ss\n' \
-            "${NATIVE_CACHE_HIT:-false}" "$((elapsed / 60))" "$((elapsed % 60))" >> "$GITHUB_STEP_SUMMARY"
+          printf '### APK build\n\n- Toolchain cache hit: %s\n- Native cache hit: %s\n- Buildozer duration: %sm %ss\n' \
+            "${TOOLCHAIN_CACHE_HIT:-false}" "${NATIVE_CACHE_HIT:-false}" "$((elapsed / 60))" "$((elapsed % 60))" >> "$GITHUB_STEP_SUMMARY"
         env:
           ACCEPT_SDK_LICENSE: "yes"
+          TOOLCHAIN_CACHE_HIT: ${{ steps.toolchain-cache.outputs.cache-hit }}
           NATIVE_CACHE_HIT: ${{ steps.native-cache.outputs.cache-hit }}
           PYTHONUNBUFFERED: "1"
+      - name: Verify generated startup guard after Java compilation
+        run: python -m unittest discover -s tests -p test_android_startup.py -v
+        env:
+          P4A_SOURCE_DIR: .buildozer/android/platform/python-for-android
+          P4A_DIST_DIR: .buildozer/android/platform/build-arm64-v8a/dists/pplinecaller
       - name: Verify 16 KB native library alignment
         run: |
           set -o pipefail

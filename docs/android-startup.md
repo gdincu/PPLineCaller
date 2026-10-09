@@ -27,8 +27,26 @@ segment was checked for 16 KB alignment. This does not reproduce or rule out a
 device-specific loader failure on the Xiaomi phone.
 
 The regression tests compile and execute a small Java startup harness covering
-both failed and successful loading, plus hook idempotence and upstream drift.
+both failed and successful loading, plus hook idempotence and upstream drift,
+including additional loading calls in an already-patched distribution.
 Run `python -m unittest discover -s tests -v`; the Java test requires a JDK.
+
+CI also checks the real Java bootstrap from the `p4a.commit` pinned in
+`buildozer.spec`. Set `P4A_SOURCE_DIR` to that checkout to run this check locally.
+The APK workflow checks that the generated `PythonActivity.java` matches the
+expected guarded source after Gradle successfully compiles it. Set `P4A_DIST_DIR`
+to the generated distribution to enable that additional check; a configured but
+missing checkout or distribution fails the tests.
+
+Android builds install the Buildozer and Cython versions in
+`requirements-android.txt` and fetch the exact p4a commit instead of following
+the moving `develop` branch. Update these pins deliberately and run both CI
+workflows before relying on a new toolchain.
+
+SDK, NDK, and Ant have a separate cache from native outputs. Changing a hook or
+local recipe invalidates native binaries without discarding the toolchain.
+`tools/prepare-android-ndk.sh` is included in both cache keys and checks the
+16 KB CMake linker patch on fresh and restored NDKs.
 
 Rebuild the APK with the updated hook and install it on the phone. If native
 loading still fails, record the message from the **SDL Error** dialog. It names
