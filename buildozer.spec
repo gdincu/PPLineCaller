@@ -12,7 +12,8 @@ android.permissions = CAMERA
 android.api = 34
 android.minapi = 24
 android.build_tools = 34.0.0
-android.ndk = 25b
+# LLVM's RELRO/PT_LOAD padding fix requires a newer linker than NDK r25b.
+android.ndk = 28c
 android.archs = arm64-v8a
 android.accept_sdk_license = True
 p4a.branch = develop

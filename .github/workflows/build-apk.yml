@@ -91,29 +91,10 @@ jobs:
         env:
           P4A_SOURCE_DIR: .buildozer/android/platform/python-for-android
           P4A_DIST_DIR: .buildozer/android/platform/build-arm64-v8a/dists/pplinecaller
-      - name: Verify 16 KB native library alignment
+      - name: Verify native ELF alignment and RELRO on 4 KB and 16 KB pages
         run: |
           set -o pipefail
-          apk=$(ls bin/*.apk | head -n1)
-          echo "APK: $apk"
-          tmp=$(mktemp -d)
-          unzip -q "$apk" 'lib/arm64-v8a/*.so' -d "$tmp"
-          bad=0
-          for so in "$tmp"/lib/arm64-v8a/*.so; do
-            if [ "$(head -c4 "$so" | od -An -tx1 | tr -d ' ')" != "7f454c46" ]; then
-              echo "SKIP (not ELF): $so"
-              continue
-            fi
-            if ! readelf -lW "$so" | grep LOAD | grep -qE '0x(4000|10000)$'; then
-              echo "NOT 16KB-ALIGNED: $so"
-              readelf -lW "$so" | grep LOAD
-              bad=1
-            fi
-          done
-          if [ "$bad" = "0" ]; then
-            echo "All native libs are 16 KB aligned"
-          fi
-          exit $bad
+          python tools/validate_android_elf.py bin/*.apk
       - run: |
           echo "=== bin ==="; ls -lhR bin 2>&1 || true
           echo "=== find apk/aab ==="; find . -maxdepth 5 -name "*.apk" -o -name "*.aab" | xargs ls -lh 2>&1 || true
@@ -122,5 +103,5 @@ jobs:
         if: always()
         with: {name: buildozer-log, path: buildozer.log, if-no-files-found: warn}
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with: {name: apk, path: bin/, if-no-files-found: warn}

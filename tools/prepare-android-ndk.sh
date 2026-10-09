@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # This file is hashed by both caches: changing linker patches invalidates them.
+# Use the pinned r28c linker: older LLD can round RELRO past the final LOAD
+# on 4 KB devices when common-page-size=16384 (LLVM PR #66042).
 set -euo pipefail
 
 ndk_revision="${1:?Usage: prepare-android-ndk.sh NDK_REVISION}"
@@ -34,3 +36,4 @@ if not patched:
     raise SystemExit("Cannot apply 16 KB linker flags: NDK CMake toolchain changed")
 PY
 grep -n "max-page-size" "$ndk_dir"/build/cmake/*.cmake
+"$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin/ld.lld" --version

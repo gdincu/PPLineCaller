@@ -1,5 +1,52 @@
 # Android native startup failure
 
+## Confirmed cause and fix
+
+The subsequent SDL dialog on the Xiaomi 11T / Android 14 reports:
+
+```
+dlopen failed: can't enable GNU RELRO protection for ".../libpng16.so": Out of memory
+```
+
+This is a native ELF layout error, rather than a shortage of phone RAM. The
+original APK's `libpng16.so` has the following relevant program headers:
+
+| Segment | Virtual address | Memory size | End |
+| --- | ---: | ---: | ---: |
+| Final `PT_LOAD` | `0x4e5f0` | `0x708` | `0x4ecf8` |
+| `PT_GNU_RELRO` | `0x4e5f0` | `0x1a10` | `0x50000` |
+
+On a 4 KB device, Android reserves the LOAD image through `0x4f000`, but RELRO
+asks `mprotect` to protect memory through `0x50000`. That extra page is outside
+the library's reservation, causing `ENOMEM`. The old APK also has the same
+problem in `libwebpdemux.so` and `libwebpmux.so`.
+
+NDK r25b's older LLD rounds RELRO for `common-page-size=16384` without padding
+the last LOAD segment. [LLVM PR #66042](https://github.com/llvm/llvm-project/pull/66042)
+fixes this by adding `.relro_padding` and extending the associated LOAD.
+The Android build now uses **NDK r28c**, which is also the recommendation in
+the pinned python-for-android revision. All libraries and C++/OpenMP runtimes
+come from this NDK; the hook no longer swaps in runtimes from an unrelated NDK.
+Explicit 16 KB link flags remain enabled. This preserves RELRO protection and
+16 KB compatibility while fixing loading on 4 KB devices.
+
+Changing `buildozer.spec` and the NDK preparation script invalidates the exact
+native/toolchain cache keys. Native outputs are rebuilt with the new linker.
+The APK workflow now validates every native ELF, including Python extension
+modules inside `libpybundle.so`, with:
+
+```sh
+python tools/validate_android_elf.py bin/*.apk
+```
+
+The check requires every LOAD segment to have compatible 16 KB alignment and
+verifies RELRO stays inside Android's reserved LOAD image at both 4 KB and
+16 KB page sizes. It deliberately accepts reserved gaps between LOAD segments,
+matching [Android 14's linker](https://android.googlesource.com/platform/bionic/+/refs/tags/android-14.0.0_r1/linker/linker_phdr.cpp).
+Only successfully validated APKs are uploaded as installable artifacts.
+
+## Original secondary crash
+
 The reported Xiaomi 11T / Android 14 stack ends in
 `SDLActivity.nativeSetenv` from `PythonActivity.UnpackFilesTask.onPostExecute`.
 This runs before `app/main.py`, so Python exception handling cannot fix it.
@@ -16,15 +63,22 @@ successful startup continues normally. The hook patches the generated Java
 before Gradle compilation and also covers cached distributions. It fails the
 build if the upstream patch location changes.
 
-## Validation and remaining diagnosis
+## Validation
 
 The unmodified APK from [CI run 37925839819](https://github.com/gdincu/PPLineCaller/actions/runs/37925839819)
 was inspected and launched on the local Android 15 emulator using ARM64
 translation. All native libraries loaded, Python/Kivy initialized, and the app
 reached its main loop. `libSDL2.so` exports both `JNI_OnLoad` and
 `Java_org_libsdl_app_SDLActivity_nativeSetenv`. Every packaged ELF's `PT_LOAD`
-segment was checked for 16 KB alignment. This does not reproduce or rule out a
-device-specific loader failure on the Xiaomi phone.
+segment was checked for 16 KB alignment. ARM translation did not reproduce the
+phone's RELRO failure; alignment alone was an insufficient check.
+
+The new ELF verifier rejects that original APK with precisely the three RELRO
+overruns above. Regression cases use the failing libpng program headers and
+cover the padded correction, both ELF classes/byte orders, all LOAD segments,
+truncated headers, reserved gaps, and bundled Python extensions. A small ARM64
+library linked locally with LLD 18 verifies the fixed linker emits
+`.relro_padding`, with both LOAD and RELRO ending at the same page boundary.
 
 The regression tests compile and execute a small Java startup harness covering
 both failed and successful loading, plus hook idempotence and upstream drift,
@@ -48,7 +102,7 @@ local recipe invalidates native binaries without discarding the toolchain.
 `tools/prepare-android-ndk.sh` is included in both cache keys and checks the
 16 KB CMake linker patch on fresh and restored NDKs.
 
-Rebuild the APK with the updated hook and install it on the phone. If native
+Install the APK rebuilt with NDK r28c on the phone. If native
 loading still fails, record the message from the **SDL Error** dialog. It names
 the original missing library, symbol, or linker error needed to fix the
 underlying load failure. Alternatively, capture startup logs with USB debugging:
