@@ -112,6 +112,21 @@ local recipe invalidates native binaries without discarding the toolchain.
 `tools/prepare-android-ndk.sh` is included in both cache keys and checks the
 16 KB CMake linker patch on fresh and restored NDKs.
 
+The native cache also hashes `tools/prepare_python_for_android.py`, which fetches
+the pinned p4a revision and applies its 16 KB linker flags. The workflow itself
+is excluded: changing APK upload options, logging, or application Python code
+does not force a native rebuild. Keep native preparation in the hashed scripts;
+if compiler settings or native inputs change elsewhere, update the cache inputs
+or bump its version. Native binaries are restored only for an exact key match.
+
+The `buildozer-native-v3` key replaces the old workflow-dependent key, so its
+first build needs to populate a new cache. Toolchain downloads still reuse the
+existing cache. Gradle dependencies and its wrapper have a separate download
+cache. Same-branch APK runs are serialized so a cold build can finish saving
+compiled libraries before the next run restores them; GitHub keeps only the
+newest pending run in that concurrency group. The build summary reports cache
+hits and Buildozer duration, and a native miss produces a visible notice.
+
 Install the APK rebuilt with NDK r28c on the phone. If native
 loading still fails, record the message from the **SDL Error** dialog. It names
 the original missing library, symbol, or linker error needed to fix the

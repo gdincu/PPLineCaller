@@ -1,5 +1,9 @@
 name: build-apk
 on: [push, workflow_dispatch]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Let a cold build finish saving its cache before the next push restores it.
+  cancel-in-progress: false
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -10,23 +14,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y openjdk-17-jdk unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
       - run: python -m pip install -r requirements-android.txt
       - name: Prepare python-for-android with 16 KB alignment
-        run: |
-          set -o pipefail
-          # Pre-install p4a (buildozer.spec points p4a.source_dir at this
-          # checkout) with link flags so every compiled lib is 16 KB-aligned.
-          p4a_commit=$(python -c 'import configparser; c = configparser.ConfigParser(); c.read("buildozer.spec"); print(c["app"]["p4a.commit"])')
-          p4a_dir=.buildozer/android/platform/python-for-android
-          mkdir -p "$p4a_dir"
-          git -C "$p4a_dir" init
-          git -C "$p4a_dir" fetch --depth 1 https://github.com/kivy/python-for-android.git "$p4a_commit"
-          git -C "$p4a_dir" checkout --detach FETCH_HEAD
-          test "$(git -C "$p4a_dir" rev-parse HEAD)" = "$p4a_commit"
-          sed -i "s|^    common_ldflags = \['-L{ctx_libs_dir}'\]|    common_ldflags = ['-L{ctx_libs_dir}', '-Wl,-z,max-page-size=16384', '-Wl,-z,common-page-size=16384']|" \
-            .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
-          grep -n "max-page-size" .buildozer/android/platform/python-for-android/pythonforandroid/archs.py
-          printf 'APP_LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384\n' >> \
-            .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
-          tail -n 3 .buildozer/android/platform/python-for-android/pythonforandroid/bootstraps/_sdl_common/build/jni/Application.mk
+        run: python tools/prepare_python_for_android.py
       - name: Identify Android build toolchain
         id: android-toolchain
         run: |
@@ -63,9 +51,21 @@ jobs:
           # Keep the p4a checkout and app staging fresh. Cache native recipes,
           # distributions, and source downloads only.
           path: .buildozer/android/platform/build-*
-          # Exact matches only: never reuse native binaries across changed
-          # recipes, ABI/API settings, hooks, or 16 KB alignment patches.
-          key: buildozer-native-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.android-toolchain.outputs.fingerprint }}-${{ hashFiles('buildozer.spec', 'requirements-android.txt', 'p4a-recipes/**', 'p4a-hook.py', 'tools/prepare-android-ndk.sh', '.github/workflows/build-apk.yml') }}
+          # Exact native-input matches only. Workflow upload/preview changes do
+          # not invalidate compiled libraries; both alignment scripts still do.
+          key: buildozer-native-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.android-toolchain.outputs.fingerprint }}-${{ hashFiles('buildozer.spec', 'requirements-android.txt', 'p4a-recipes/**', 'p4a-hook.py', 'tools/prepare-android-ndk.sh', 'tools/prepare_python_for_android.py') }}
+      - name: Cache Gradle downloads
+        id: gradle-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: buildozer-gradle-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('buildozer.spec', 'requirements-android.txt') }}
+          # Gradle resolves dependency versions itself; reuse downloads even
+          # when native settings change. Native binaries have no fallback key.
+          restore-keys: |
+            buildozer-gradle-v1-${{ runner.os }}-${{ runner.arch }}-
       - name: Prepare NDK with 16 KB alignment
         run: |
           # CMake-built recipes (opencv, jpeg, libwebp) ignore p4a's LDFLAGS and
@@ -76,15 +76,19 @@ jobs:
       - name: Build debug APK
         run: |
           set -o pipefail
+          if [ "${NATIVE_CACHE_HIT:-false}" != "true" ]; then
+            echo "::notice::Native cache miss: this build must compile native libraries. Later builds with the same native inputs can reuse them."
+          fi
           start=$SECONDS
           buildozer android debug 2>&1 | tee buildozer.log
           elapsed=$((SECONDS - start))
-          printf '### APK build\n\n- Toolchain cache hit: %s\n- Native cache hit: %s\n- Buildozer duration: %sm %ss\n' \
-            "${TOOLCHAIN_CACHE_HIT:-false}" "${NATIVE_CACHE_HIT:-false}" "$((elapsed / 60))" "$((elapsed % 60))" >> "$GITHUB_STEP_SUMMARY"
+          printf '### APK build\n\n- Toolchain cache hit: %s\n- Native cache hit: %s\n- Gradle cache hit: %s\n- Buildozer duration: %sm %ss\n' \
+            "${TOOLCHAIN_CACHE_HIT:-false}" "${NATIVE_CACHE_HIT:-false}" "${GRADLE_CACHE_HIT:-false}" "$((elapsed / 60))" "$((elapsed % 60))" >> "$GITHUB_STEP_SUMMARY"
         env:
           ACCEPT_SDK_LICENSE: "yes"
           TOOLCHAIN_CACHE_HIT: ${{ steps.toolchain-cache.outputs.cache-hit }}
           NATIVE_CACHE_HIT: ${{ steps.native-cache.outputs.cache-hit }}
+          GRADLE_CACHE_HIT: ${{ steps.gradle-cache.outputs.cache-hit }}
           PYTHONUNBUFFERED: "1"
       - name: Verify generated startup guard after Java compilation
         run: python -m unittest discover -s tests -p test_android_startup.py -v
