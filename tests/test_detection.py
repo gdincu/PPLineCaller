@@ -15,6 +15,7 @@ from serve_caller import (AutoTuneCollector, BallTracker, ServeCaller, TableMapp
                           bounce_vertex, is_bounce, detect_ball_hsv,
                           detect_ball_nv21, decode_nv21_roi,
                           expected_ball_area_range)
+from capture_pipeline import DetectionSession, TARGET_FPS, preview_due
 
 POLY = np.array([[570, 440], [150, 440], [250, 180], [500, 180]], np.float32)
 BASE = dict(min_area=200, max_area=4800, white_v_min=150, white_s_max=60,
@@ -66,8 +67,10 @@ def app_method(name, globals_=None):
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'ServeApp')
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
     ns = dict(np=np, cv2=cv2, time=SimpleNamespace(perf_counter=lambda: 1.0),
-              Logger=SimpleNamespace(info=lambda *a: None, exception=lambda *a: None),
-              detect_ball_nv21=detect_ball_nv21)
+              Logger=SimpleNamespace(info=lambda *a: None, error=lambda *a: None,
+                                     exception=lambda *a: None),
+              detect_ball_nv21=detect_ball_nv21, preview_due=preview_due,
+              TARGET_FPS=TARGET_FPS)
     ns.update(globals_ or {})
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(ROOT / 'app/main.py'), 'exec'), ns)
     return ns[name]
@@ -288,27 +291,48 @@ class FramePipelineTests(unittest.TestCase):
                 self.assertEqual(len(caller.bounces), 1)
 
     def test_render_throttle_never_changes_detection_path(self):
-        detect = Mock(wraps=detect_ball_nv21)
-        clock = iter([0, .001, 1/30, .034, 2/30, .068])
-        tick = app_method('tick', {'detect_ball_nv21': detect,
+        clock = iter([0, .001, 1/60, .018, 2/60, .035, 3/60, .052])
+        tick = app_method('tick', {
             'time': SimpleNamespace(perf_counter=lambda: next(clock))})
         caller = ServeCaller(mapper())
         caller.reset()
+        params = dict(BASE, min_circ=.65, min_circ_streak=.35, max_aspect=4,
+            min_solidity=.85, min_fill=.7, min_vertices=6, max_jump=180,
+            confirm_streak=1, min_drop=3, min_rise=3)
+        # Deterministic handoff, using the production processing session. Real
+        # thread concurrency and queue replacement are checked separately.
+        session = DetectionSession(caller.table, params, True)
+        class Worker:
+            result = None
+            count = 0
+            def submit(self, raw, timestamp):
+                self.count += 1
+                self.result = session.process(raw, timestamp)
+            def take_result(self):
+                result, self.result = self.result, None
+                return result
+        worker = Worker()
         app = SimpleNamespace(_auto_tune=None, _tick_count=0, calibrating=False,
-            table=caller.table, caller=caller, tracker=BallTracker(), params=dict(BASE,
-            min_circ=.65, min_circ_streak=.35, max_aspect=4, min_solidity=.85,
-            min_fill=.7, min_vertices=6), _last_detection_time=None, _prev_small=None,
-            _render_every=2, _said=False, _tick_ms_ema=0, frame=None,
+            table=caller.table, caller=caller, _detector=worker,
+            _paused=False, _last_result=None, _preview_raw=None,
+            _last_render_time=None, assist_mode=False, _stats_time=0,
+            _said=False, _tick_ms_ema=0, frame=None,
             status=SimpleNamespace(text=''), _decode_full_nv21=Mock(
                 side_effect=lambda yuv, w, h, buf: cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV21)),
             _upload=Mock(), _draw_assist_overlay=Mock(), say=Mock())
-        for y in (240, 270, 250):
+        for i, y in enumerate((240, 270, 250)):
             image = scene()
             cv2.circle(image, (420, y), 10, (230, 230, 230), -1)
             yuv = nv21(image)
             app._grab_nv21 = lambda: (yuv.tobytes(), 640, 480, yuv)
-            tick(app, 1 / 30)
-        self.assertEqual(detect.call_count, 3)
+            app._frame_timestamp = i / 60
+            tick(app, 1 / 60)
+        self.assertIsNone(caller.verdict)
+        # A cached camera tick must still consume/speak the completed verdict,
+        # and force a render before the next 5 FPS preview deadline.
+        app._grab_nv21 = lambda: None
+        tick(app, 1 / 60)
+        self.assertEqual(worker.count, 3)
         self.assertEqual(app._decode_full_nv21.call_count, 2)
         self.assertEqual(caller.verdict, 'IN')
         app.say.assert_called_once_with('In')
@@ -353,7 +377,8 @@ class FramePipelineTests(unittest.TestCase):
         caller.verdict, caller.state = 'IN', 'DECIDED'
         app = SimpleNamespace(calibrating=False, table=caller.table, caller=caller,
             tracker=BallTracker(), params=dict(BASE), _auto_tune=None,
-            _prev_small=np.ones((2, 2), np.uint8), status=SimpleNamespace(text=''))
+            _prev_small=np.ones((2, 2), np.uint8), status=SimpleNamespace(text=''),
+            _configure_detection=Mock())
         app_method('start_auto_tune', {'AutoTuneCollector': AutoTuneCollector})(app)
         self.assertIsNone(caller.verdict)
         self.assertEqual(caller.state, 'IDLE')
@@ -368,7 +393,7 @@ class FramePipelineTests(unittest.TestCase):
             c.add(scene())
         app = SimpleNamespace(_auto_tune=c, _auto_needed=45, _auto_started=0,
             params=dict(BASE), status=SimpleNamespace(text=''),
-            _apply_live_settings=Mock())
+            _apply_live_settings=Mock(), _configure_detection=Mock())
         app_method('_finish_auto_tune')(app)
         self.assertEqual(app.params, BASE)
         self.assertIn('rejected', app.status.text)

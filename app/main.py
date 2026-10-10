@@ -33,9 +33,13 @@ from kivy.uix.slider import Slider
 from kivy.metrics import dp
 
 from serve_caller import (TableMapper, ServeCaller,
-                            detect_ball_nv21, BallTracker,
+                            BallTracker,
                             debug_contours_for_frame, AutoTuneCollector,
                             expected_ball_area_range)
+from capture_pipeline import (DetectionSession, DetectionWorker, TARGET_FPS,
+                              preview_due)
+from camera_policy import discover_camera_modes, apply_preview_mode
+from android_capture import tracked_camera_class
 
 from plyer import tts
 
@@ -144,14 +148,25 @@ class ServeApp(App):
         self.frame = None
         self._prev_small = None
         self._last_camera_buffer = None
+        self._last_capture_sequence = None
+        self._frame_timestamp = None
         self._last_detection_time = None
         self._tex = None
         self._said = False
-        # perf: EMA of tick cost + render throttle (preview at ~15Hz during
-        # SERVE_LIVE, full rate while calibrating/judging).
+        # Detection runs independently of GL/preview work. Pending frames are
+        # bounded so an overloaded phone never builds a queue of old serves.
+        self._detector = DetectionWorker()
+        self._last_result = None
+        self._preview_raw = None
+        self._last_render_time = None
+        self._paused = False
+        self._camera_fps_range = None
+        self._camera_index = None
+        self._stats_captures = 0
+        self._stats_time = time.perf_counter()
+        self._stats_counts = (0, 0, 0)
         self._tick_count = 0
         self._tick_ms_ema = 0.0
-        self._render_every = 2
         self._exposure_locked = False
         self.tuning_open = False
         self._tune_sliders = {}
@@ -233,7 +248,7 @@ class ServeApp(App):
             self._tune_values[key] = val_label
         self.tune_scroll.add_widget(self.tune_grid)
         root.add_widget(self.tune_scroll)
-        Clock.schedule_interval(self.tick, 1.0 / 30.0)
+        self._tick_event = Clock.schedule_interval(self.tick, 1.0 / TARGET_FPS)
         return root
 
     # -- config ---------------------------------------------------------
@@ -284,6 +299,17 @@ class ServeApp(App):
         self.tracker.confirm_streak = int(p["confirm_streak"])
         self.caller.min_drop = float(p["min_drop"])
         self.caller.min_rise = float(p["min_rise"])
+        self._configure_detection()
+
+    def _configure_detection(self):
+        """Invalidate old results before changing serve/calibration/settings."""
+        self._last_result = None
+        if (self.calibrating or self._auto_tune is not None
+                or self.table.H is None or self.caller.state == "DECIDED"):
+            self._detector.configure(None)
+        else:
+            self._detector.configure(DetectionSession(
+                self.table, self.params, self.caller.state == "SERVE_LIVE"))
 
     # -- assist / auto-tune ---------------------------------------------
     def toggle_assist(self, *_):
@@ -340,6 +366,7 @@ class ServeApp(App):
             self.table.quarter_poly("server_right"),
             base_params=dict(self.params))
         self._auto_needed = 45
+        self._configure_detection()
         self.status.text = "AUTO TUNE: keep table EMPTY & still for 2s... (collecting)"
         Logger.info("PPLineCaller: auto-tune start, collecting 45 frames")
 
@@ -350,6 +377,7 @@ class ServeApp(App):
         self._auto_started = None
         if collector is None or collector.frames < 5:
             self.status.text = "Auto-tune: not enough frames (camera not ready)."
+            self._configure_detection()
             return
         try:
             suggested, report = collector.suggest()
@@ -377,6 +405,8 @@ class ServeApp(App):
         except Exception as e:
             Logger.exception(f"PPLineCaller: auto-tune failed: {e}")
             self.status.text = f"Auto-tune failed: {e}"
+        finally:
+            self._configure_detection()
 
     def _draw_assist_overlay(self, frame, qpoly):
         """Yellow candidate contours + stats for live tuning. No-op if not assist."""
@@ -442,6 +472,7 @@ class ServeApp(App):
         self._auto_needed = 0
         self.calib_pts = []
         self.calibrating = True
+        self._configure_detection()
         self._prev_small = None  # bbox changes after re-calibration
         self.status.text = f"Tap 1/4: {CALIB_STEPS[0]}"
 
@@ -496,12 +527,16 @@ class ServeApp(App):
                 self.caller = ServeCaller(self.table)
                 self.tracker.reset()
                 self._prev_small = None  # new crop -> fresh motion ref
+                self._configure_detection()
                 self.status.text = "Calibrated. Tap START SERVE."
             return True
         # Idle taps do nothing (quarter is fixed to the tap-1 slot).
         return False
 
     def start_serve(self, *_):
+        if self.calibrating:
+            self.status.text = "Finish calibration before START SERVE."
+            return
         if self._auto_tune is not None:
             self.status.text = "Wait for AUTO TUNE to finish, then START SERVE."
             return
@@ -517,6 +552,13 @@ class ServeApp(App):
         self._said = False
         self._tick_count = 0
         self._tick_ms_ema = 0.0
+        self._last_render_time = None
+        # Auto Tune may have enabled these diagnostics. Normal serves must not
+        # pay for a second HSV/contour pipeline; users can re-enable explicitly.
+        self.assist_mode = self.assist_mask_preview = False
+        self.assist_btn.text = "ASSIST OFF"
+        self._mask_btn.text = "MASK OFF"
+        self._configure_detection()
         self.status.text = "Watching serve..."
 
     # -- android camera -------------------------------------------------
@@ -540,15 +582,48 @@ class ServeApp(App):
         if self.cam is not None:
             return
         try:
-            from kivy.core.camera import Camera as CoreCamera
-            self.cam = CoreCamera(index=0, resolution=(1280, 720))
-            self.cam.start()
+            from jnius import autoclass
+            from kivy.core.camera.camera_android import CameraAndroid
+            modes = discover_camera_modes(
+                autoclass('android.hardware.Camera'),
+                autoclass('android.hardware.Camera$CameraInfo'),
+                lambda msg: Logger.info(f"PPLineCaller: {msg}"))
+            provider = tracked_camera_class(CameraAndroid)
+            for mode in modes:
+                candidate = None
+                try:
+                    # CoreCamera starts automatically unless stopped=True.
+                    # Configure before preview, and start exactly once.
+                    candidate = provider(index=mode.index, resolution=mode.size,
+                                         stopped=True)
+                    actual = apply_preview_mode(candidate._android_camera,
+                                                mode.size, mode.requested)
+                    candidate.start()
+                    self.cam = candidate
+                    self._camera_index = mode.index
+                    self._camera_fps_range = actual
+                    self._actual_size = mode.size
+                    Logger.info(f"PPLineCaller: selected camera={mode.index} "
+                                f"size={mode.size} requested-fps={mode.requested} "
+                                f"configured-fps={actual}")
+                    if actual[1] < TARGET_FPS * 1000:
+                        Logger.warning("PPLineCaller: legacy preview exposes less "
+                                       "than 60 FPS; native recording capabilities "
+                                       "may differ from NV21 preview capabilities")
+                    break
+                except Exception as exc:
+                    Logger.warning(f"PPLineCaller: camera start rejected {mode}: {exc}")
+                    if candidate is not None:
+                        candidate._release_camera()
+            if self.cam is None:
+                raise RuntimeError("No selected camera could start preview")
             # Do NOT lock exposure here: AE has not converged yet, so
             # locking now freezes the dark boot frame (black room, only
             # lights visible). Let Android auto-expose first, then apply
-            # a brightness-safe stabilization (no AE/AWB lock, EC=0,
-            # flexible FPS range) once it has adapted.
+            # neutral exposure compensation once it has adapted. FPS is already
+            # configured before preview; AE/AWB stay unlocked.
             Clock.schedule_once(lambda dt: self._lock_exposure(), 3.0)
+            self._schedule_camera_drain()
             ok, msg = self._ensure_focus()
             Logger.info(f"PPLineCaller: initial focus: {msg}")
             # Warm the TTS engine now (background thread) so the first
@@ -558,17 +633,7 @@ class ServeApp(App):
             self.status.text = f"Camera error: {e}"
 
     def _lock_exposure(self):
-        """Brightness-safe preview stabilization (delayed, best-effort).
-
-        Never locks AE/AWB: locking before AE converges froze a dark boot
-        frame. Resets exposure compensation to 0 and requests a FLEXIBLE
-        FPS range: among ranges with the highest max (usually 30000 = 30
-        fps) pick the one with the LOWEST min (e.g. [15000,30000] over
-        [30000,30000]) so dim light may drop FPS to stay bright while
-        bright light still gets 30 FPS. FPS is left untouched if no
-        flexible range exists. Any failure only logs; focus is handled
-        separately in _ensure_focus.
-        """
+        """Reset compensation after adaptation, without locking AE/AWB."""
         if self._exposure_locked:
             return
         try:
@@ -576,43 +641,57 @@ class ServeApp(App):
             if cam is None:
                 Logger.info("PPLineCaller: no _android_camera, skip exposure stabilize")
                 return
-            params = cam.getParameters()
             info = []
             try:
+                params = cam.getParameters()
                 lo, hi = params.getMinExposureCompensation(), params.getMaxExposureCompensation()
                 target = max(lo, min(hi, 0))  # neutral exposure
                 params.setExposureCompensation(target)
+                cam.setParameters(params)
                 info.append(f"ec={target}[{lo},{hi}]")
             except Exception as e:
                 info.append(f"ec-fail:{e}")
-            try:
-                ranges = params.getSupportedPreviewFpsRange()
-                if ranges:
-                    parsed = [(r[0], r[1]) for r in ranges]
-                    top_max = max(r[1] for r in parsed)
-                    cands = [r for r in parsed if r[1] == top_max]
-                    # lowest min among the fastest-max ranges: keeps 30fps
-                    # available without forbidding low-light FPS drop.
-                    best = min(cands, key=lambda r: r[0])
-                    if best[0] == best[1]:
-                        # only a fixed high-FPS range exists -> setting it
-                        # would force darkness in dim rooms, so skip it.
-                        info.append(f"fps-skip-fixed{best}")
-                    else:
-                        params.setPreviewFpsRange(best[0], best[1])
-                        info.append(f"fps={best}")
-                else:
-                    info.append("fps-none")
-            except Exception as e:
-                info.append(f"fps-fail:{e}")
-            try:
-                cam.setParameters(params)
-                self._exposure_locked = True
-            except Exception as e:
-                info.append(f"apply-fail:{e}")
+            self._exposure_locked = True
+            self._actual_size = None
             Logger.info("PPLineCaller: exposure stabilize: " + " ".join(info))
         except Exception as e:
             Logger.info(f"PPLineCaller: exposure stabilize skipped: {e}")
+
+    def _schedule_camera_drain(self):
+        """Drain the camera SurfaceTexture at capture rate to avoid backpressure.
+
+        The tracked provider skips unused FBO rendering. Our decoded NV21 UI
+        preview keeps its own slower schedule, independently of this drain.
+        """
+        event = getattr(self.cam, "_update_ev", None)
+        update = getattr(self.cam, "_update", None)
+        if event is not None and update is not None:
+            event.cancel()
+            self.cam._update_ev = Clock.schedule_interval(
+                update, 1.0 / TARGET_FPS)
+
+    def on_stop(self):
+        self._tick_event.cancel()
+        self._detector.close()
+        if self.cam is not None:
+            self.cam.stop()
+
+    def on_pause(self):
+        self._paused = True
+        self._detector.configure(None)
+        if self.cam is not None:
+            self.cam.stop()
+        return True
+
+    def on_resume(self):
+        if self.cam is not None:
+            self.cam.start()
+            self._schedule_camera_drain()
+        self._last_camera_buffer = None
+        self._last_capture_sequence = None
+        self._last_render_time = None
+        self._configure_detection()
+        self._paused = False
 
     def _ensure_focus(self):
         """Lock focus once at startup. Returns (ok, msg).
@@ -689,15 +768,24 @@ class ServeApp(App):
         if self.cam is None:
             return None
         try:
-            buf = self.cam.grab_frame()
+            if hasattr(self.cam, "snapshot"):
+                snapshot = self.cam.snapshot(self._last_capture_sequence)
+                if snapshot is None:
+                    return None
+                sequence, timestamp, buf = snapshot
+                self._last_capture_sequence = sequence
+                self._frame_timestamp = timestamp
+            else:
+                buf = self.cam.grab_frame()
+                if buf == self._last_camera_buffer:
+                    return None
+                self._frame_timestamp = time.perf_counter()
         except Exception:
             return None
         if buf is None:
             return None
-        # Kivy grab_frame returns the cached preview buffer. Repeated clock
-        # ticks on a slower camera must not count as observations or tune samples.
-        if buf == self._last_camera_buffer:
-            return None
+        # Callback sequence distinguishes fresh identical images from cached
+        # frames without comparing an entire 720p buffer on every tick.
         self._last_camera_buffer = buf
         try:
             w, h = self._preview_size()
@@ -729,7 +817,7 @@ class ServeApp(App):
             return None
 
     def say(self, text):
-        """Speak without blocking the 30Hz tick: tts.speak() on Android can
+        """Speak without blocking the capture tick: tts.speak() on Android can
         take 1-3s (engine init + utterance), which used to stall the whole
         detection loop and delay the verdict after it was already decided."""
         def _speak():
@@ -753,143 +841,135 @@ class ServeApp(App):
 
     def tick(self, _dt):
         t0 = time.perf_counter()
+        if self._paused:
+            return
         if self._auto_tune is not None and t0 - self._auto_started > 6.0:
             self._finish_auto_tune()
-        raw = self._grab_nv21()
-        if raw is None:
+
+        # Consume results even when grab_frame returns a cached buffer. A
+        # verdict must not wait for a fresh camera frame or a preview deadline.
+        result = self._detector.take_result()
+        force_render = False
+        if result is not None:
+            if result.error is not None:
+                Logger.error(f"PPLineCaller: detection failed: {result.error}")
+                self.status.text = f"Detection error: {result.error}"
+                self.caller.state = "IDLE"
+                self._last_result = None
+                self._detector.configure(None)
+            else:
+                self._last_result = result
+                self.caller.state = result.state
+                self.caller.verdict = result.verdict
+                self.caller.reason = result.reason
+                self.caller.bounces = list(result.bounces)
+                if result.verdict == "IN" and not self._said:
+                    self.status.text = f"IN: {result.reason}"
+                    self.say("In")
+                    self._said = True
+                    force_render = True
+                elif result.state == "SERVE_LIVE":
+                    text = f"Watching serve... bounces={len(result.bounces)}"
+                    if self.status.text != text:
+                        self.status.text = text
+
+        live = (self.caller.state == "SERVE_LIVE" and not self.calibrating
+                and self._auto_tune is None)
+        render = force_render or preview_due(t0, self._last_render_time, live)
+        needs_detection = (self.table.H is not None and not self.calibrating
+                           and self._auto_tune is None
+                           and (live or self.assist_mode)
+                           and self.caller.state != "DECIDED")
+        # Idle/setup views need not copy a full camera buffer at 60 Hz.
+        if not (needs_detection or render or self._auto_tune is not None):
             return
-        _buf, w, h, nv21 = raw
-        self._tick_count += 1
+        raw = self._grab_nv21()
+        if raw is not None:
+            self._preview_raw = raw
+            self._tick_count += 1
+            if needs_detection:
+                self._detector.submit(raw, self._frame_timestamp)
         # -- auto-tune collection (empty-table burst) -------------------
         if self._auto_tune is not None:
+            if raw is None:
+                return
+            _buf, w, h, nv21 = raw
             frame_at = self._decode_full_nv21(nv21, w, h, _buf)
             if frame_at is not None:
-                self.frame = frame_at
                 self._auto_tune.add(frame_at, luma=nv21[:h])
                 n = self._auto_tune.frames
                 self.status.text = f"AUTO TUNE: keep still... {n}/{self._auto_needed} frames"
-                # small progress bar
-                try:
+                if render:
+                    self.frame = frame_at
                     bar_w = int(frame_at.shape[1] * n / max(self._auto_needed, 1))
                     cv2.rectangle(frame_at, (0, frame_at.shape[0] - 8),
                                   (bar_w, frame_at.shape[0]), (0, 255, 0), -1)
-                except Exception:
-                    pass
-                # keep minimal overlay so user sees live view
-                qp = self.table.quarter_poly("server_right")
-                if qp is not None:
-                    cv2.polylines(frame_at, [qp.astype(int)], True, (0, 255, 0), 3)
-                self._upload(frame_at)
+                    qp = self.table.quarter_poly("server_right")
+                    if qp is not None:
+                        cv2.polylines(frame_at, [qp.astype(int)], True, (0, 255, 0), 3)
+                    self._upload(frame_at)
+                    self._last_render_time = t0
                 if n >= self._auto_needed:
                     self._finish_auto_tune()
             return
-        if self.calibrating:
+
+        if render and self._preview_raw is not None:
+            # Use the result's own image for overlays, especially at contact.
+            # Before the first result / while calibrating use the latest preview.
+            sample = self._last_result
+            use_sample = sample is not None and (live or force_render or (
+                self.assist_mode and self.caller.state != "DECIDED"))
+            render_raw = sample.raw if use_sample else self._preview_raw
+            _buf, w, h, nv21 = render_raw
             frame = self._decode_full_nv21(nv21, w, h, _buf)
             if frame is None:
                 return
             self.frame = frame
-            self._draw_calib_points(frame)
-            self._upload(frame)
-            return
-        if self.table.H is None:
-            frame = self._decode_full_nv21(nv21, w, h, _buf)
-            if frame is None:
-                return
-            self.frame = frame
-            self._upload(frame)
-        else:
-            p = self.params
-            # ROI-first: Y-plane motion check + ROI-only BGR decode.
-            # Full-frame BGR is decoded only when an upload/render is due;
-            # static ROI-only frames skip colour decode + HSV entirely.
-            # self.frame keeps the last full frame for tap mapping/overlays
-            # (resolution is fixed, so stale shape still maps correctly).
             qpoly = self.table.quarter_poly("server_right")
-            det_kwargs = dict(
-                min_area=p["min_area"], max_area=p["max_area"],
-                min_circ=p["min_circ"],
-                min_circ_streak=p["min_circ_streak"],
-                max_aspect=p["max_aspect"],
-                min_solidity=p["min_solidity"], min_fill=p["min_fill"],
-                min_vertices=int(p["min_vertices"]),
-                roi_margin=int(p["roi_margin"]),
-                motion_thresh=int(p["motion_thresh"]),
-                white_v_min=int(p["white_v_min"]),
-                white_s_max=int(p["white_s_max"]))
-            frame = None
-            # Always detect from raw Y + ROI colour. Rendering must not alternate
-            # the motion reference between limited-range Y and BGR grayscale.
-            if (self._last_detection_time is not None
-                    and t0 - self._last_detection_time > 0.20):
-                self.tracker.reset()
-                self._prev_small = None
-            self._last_detection_time = t0
-            det, curr_small = detect_ball_nv21(
-                nv21, w, h, self.tracker.pos, table_poly=qpoly,
-                prev_small=self._prev_small, **det_kwargs)
-            if curr_small is not None:
-                self._prev_small = curr_small
-            pos = self.tracker.update((det[0], det[1]) if det else None)
-            # no detection (coasting): fall back to a small radius
-            r_draw = int(det[2]) if det else 6
-            verdict = self.caller.update(
-                pos if self.tracker.observed else None,
-                timestamp=t0, track_id=self.tracker.track_id)
-            if verdict == "IN":
-                self.status.text = f"IN: {self.caller.reason}"
-                if not self._said:
-                    self.say("In")
-                    self._said = True
-            else:
-                self._said = False
-                if self.caller.state == "SERVE_LIVE":
-                    self.status.text = (f"Watching serve... "
-                                        f"bounces={len(self.caller.bounces)}")
-            # Render throttle: detect every frame, upload overlays at ~15Hz
-            # during live rallies (saves full decode + flip/cvtColor/blit);
-            # always render when decided/calibrated so calls are visible.
-            live = self.caller.state == "SERVE_LIVE" and not verdict
-            should_render = (not live) or (self._tick_count % self._render_every == 0)
-            if should_render:
-                if frame is None:
-                    # Verdict landed on an ROI-only tick: decode the full
-                    # frame now from the same buffer for the overlay/upload.
-                    frame = self._decode_full_nv21(nv21, w, h, _buf)
-                    if frame is None:
-                        return
-                    self.frame = frame
-                if pos is not None:
-                    x, y = (int(pos[0]), int(pos[1]))
-                    cv2.circle(frame, (x, y), max(r_draw, 4), (0, 0, 255), 2)
-                # draw my quadrant (thick outline)
-                if qpoly is not None:
-                    cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
+            if self.calibrating:
+                self._draw_calib_points(frame)
+            elif qpoly is not None:
+                if use_sample and sample.pos is not None:
+                    x, y = (int(sample.pos[0]), int(sample.pos[1]))
+                    cv2.circle(frame, (x, y), max(sample.radius, 4), (0, 0, 255), 2)
+                cv2.polylines(frame, [qpoly.astype(int)], True, (0, 255, 0), 3)
                 for i, (bx, by, q) in enumerate(self.caller.bounces):
                     cv2.circle(frame, (int(bx), int(by)), 8, (255, 0, 0), -1)
                     cv2.putText(frame, f"B{i+1}:{q}", (int(bx) + 10, int(by)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-                # Tuning Assist overlay (candidates / expected ball / mask inset)
-                try:
-                    self._draw_assist_overlay(frame, qpoly)
-                except Exception:
-                    pass
-                self._upload(frame)
-        # tick-time log: proves processed FPS holds 30 (33ms budget).
+                self._draw_assist_overlay(frame, qpoly)
+            self._upload(frame)
+            self._last_render_time = t0
+
         ms = (time.perf_counter() - t0) * 1000.0
         self._tick_ms_ema = ms if self._tick_count <= 1 else 0.9 * self._tick_ms_ema + 0.1 * ms
-        if self._tick_count % 60 == 0:
-            Logger.info(f"PPLineCaller: tick avg={self._tick_ms_ema:.1f}ms "
-                        f"last={ms:.1f}ms n={self._tick_count} "
-                        f"bounces={len(self.caller.bounces)}")
+        if t0 - self._stats_time >= 2.0:
+            span = t0 - self._stats_time
+            counts = self._detector.stats()
+            old = self._stats_counts
+            captures = self.cam.capture_count if self.cam is not None else 0
+            size = self._preview_size() if self.cam is not None else None
+            Logger.info(f"PPLineCaller: poll target={TARGET_FPS} "
+                        f"camera={self._camera_index} size={size} "
+                        f"range={self._camera_fps_range} "
+                        f"callback FPS={(captures-self._stats_captures)/span:.1f} "
+                        f"submitted FPS={(counts[0]-old[0])/span:.1f} "
+                        f"processed FPS={(counts[1]-old[1])/span:.1f} "
+                        f"dropped={counts[2]-old[2]} ui avg={self._tick_ms_ema:.1f}ms "
+                        f"detector={self._last_result.processing_ms if self._last_result else 0:.1f}ms")
+            self._stats_time, self._stats_counts = t0, counts
+            self._stats_captures = captures
 
     def _upload(self, frame):
         # Upload as RGB: GLES has no BGR texture format, and reuse one texture
         # instead of allocating a new one every frame.
-        buf = cv2.cvtColor(cv2.flip(frame, 0), cv2.COLOR_BGR2RGB).tobytes()
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         size = (frame.shape[1], frame.shape[0])
         if self._tex is None or self._tex.size != size:
             self._tex = Texture.create(size=size, colorfmt="rgb")
-        self._tex.blit_buffer(buf, colorfmt="rgb", bufferfmt="ubyte")
+            self._tex.flip_vertical()
+        # Writable, contiguous, one-dimensional buffer: avoid a bytes copy.
+        self._tex.blit_buffer(memoryview(rgb).cast("B"), colorfmt="rgb", bufferfmt="ubyte")
         self.view.texture = self._tex
         self.view.canvas.ask_update()
 
