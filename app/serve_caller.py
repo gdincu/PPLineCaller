@@ -210,25 +210,38 @@ def _cached_roi_mask(h, w, polygon, scale, roi_margin):
     return roi
 
 
+_KERNEL_DILATE5 = np.ones((5, 5), np.uint8)
+_KERNEL_OPEN3 = np.ones((3, 3), np.uint8)
+
+
 def _motion_mask(gray, prev_small, motion_thresh):
     """Dilated binary motion mask, or None if shapes mismatch (acquire)."""
     if prev_small is None or prev_small.shape != gray.shape:
         return None
     diff = cv2.absdiff(gray, prev_small)
     _, mot = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
-    mot = cv2.dilate(mot, np.ones((5, 5), np.uint8))
+    mot = cv2.dilate(mot, _KERNEL_DILATE5)
     return mot
+
+
+def _raw_ball_mask(hsv, white_v_min, white_s_max):
+    """White + orange HSV mask before cleanup (no median/open)."""
+    white = cv2.inRange(hsv, (0, 0, int(white_v_min)),
+                        (180, int(white_s_max), 255))
+    # inRange bounds are inclusive, so one [0,25] hue range is the exact
+    # union of the old adjacent [0,5] and [5,25] passes.
+    orange = cv2.inRange(hsv, (0, 90, 90), (25, 255, 255))
+    return cv2.bitwise_or(white, orange)
+
+
+def _clean_ball_mask(raw):
+    return cv2.morphologyEx(cv2.medianBlur(raw, 5), cv2.MORPH_OPEN,
+                            _KERNEL_OPEN3)
 
 
 def _ball_mask(hsv, white_v_min, white_s_max):
     """White + orange HSV mask, median-blurred and morph-opened."""
-    white = cv2.inRange(hsv, np.array([0, 0, int(white_v_min)]),
-                        np.array([180, int(white_s_max), 255]))
-    orange1 = cv2.inRange(hsv, np.array([5, 90, 90]), np.array([25, 255, 255]))
-    orange2 = cv2.inRange(hsv, np.array([0, 90, 90]), np.array([5, 255, 255]))
-    mask = cv2.bitwise_or(white, cv2.bitwise_or(orange1, orange2))
-    mask = cv2.medianBlur(mask, 5)
-    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return _clean_ball_mask(_raw_ball_mask(hsv, white_v_min, white_s_max))
 
 
 def _score_mask_contours(mask, scale, ox, oy, last_pos,
@@ -250,17 +263,23 @@ def _score_mask_contours(mask, scale, ox, oy, last_pos,
             # intersection clips a slow/contact ball into a rejected crescent.
             # Do this after area filtering to avoid a full-frame label pass.
             x, y, w, h = cv2.boundingRect(c)
+            motion_crop = motion_mask[y:y+h, x:x+w]
+            if not cv2.countNonZero(motion_crop):
+                continue  # zero motion under the bbox: overlap can only be 0
             local = np.zeros((h, w), dtype=np.uint8)
             shifted = c - np.array([x, y], dtype=np.int32)
             cv2.drawContours(local, [shifted], -1, 255, -1)
-            overlap = cv2.countNonZero(cv2.bitwise_and(
-                local, motion_mask[y:y+h, x:x+w]))
+            overlap = cv2.countNonZero(cv2.bitwise_and(local, motion_crop))
             if overlap < max(2, cv2.countNonZero(local) * 0.02):
                 continue
         peri = cv2.arcLength(c, True)
         if peri < 1:
             continue
         circularity = 4 * np.pi * area_small / (peri * peri)
+        # Both shape paths are conjunctive gates on circularity, so a blob
+        # below both thresholds cannot pass: skip hull/circle/rect/approx.
+        if circularity < min_circ and circularity < min_circ_streak:
+            continue
         hull_area = cv2.contourArea(cv2.convexHull(c))
         solidity = area_small / hull_area if hull_area > 0 else 0.0
         (cx, cy), r = cv2.minEnclosingCircle(c)
@@ -434,12 +453,22 @@ def detect_ball_hsv(frame_bgr, last_pos=None, table_poly=None, prev_small=None,
         need = max(6, min(30, int(min_area * scale * scale * 0.25)))
         if int(cv2.countNonZero(gated)) < need:
             return None, gray
-    # else: active track (last_pos set) -> always run full pipeline so a
+    elif mot is not None and not cv2.countNonZero(mot):
+        # Active track on a perfectly static frame: scoring applies the
+        # per-contour motion overlap test, which rejects every candidate
+        # when the dilated motion mask is all zero. Skip the colour decode.
+        return None, gray
+    # else: active track with some motion -> always run full pipeline so a
     # slow/hanging ball near the track is never skipped; first frame /
     # bbox changed (mot None) -> run full pipeline to acquire.
 
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    mask = _ball_mask(hsv, white_v_min, white_s_max)
+    raw = _raw_ball_mask(hsv, white_v_min, white_s_max)
+    # Nothing ball-coloured in the ROI: median/open/findContours on an empty
+    # mask cannot yield a contour, so skip cleanup and scoring entirely.
+    if not cv2.countNonZero(raw):
+        return None, gray
+    mask = _clean_ball_mask(raw)
 
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
@@ -492,6 +521,11 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
         need = max(6, min(30, int(min_area * scale * scale * 0.25)))
         if int(cv2.countNonZero(gated)) < need:
             return None, gray
+    elif mot is not None and not cv2.countNonZero(mot):
+        # Active track on a perfectly static frame: the per-contour motion
+        # overlap test in scoring would reject every candidate, so the
+        # colour ROI decode below cannot produce a detection. Skip it.
+        return None, gray
     roi_bgr, ox2, oy2 = decode_nv21_roi(nv21, w, h, x0, y0, x1, y1)
     if roi_bgr is None:
         return None, gray
@@ -511,7 +545,11 @@ def detect_ball_nv21(nv21, w, h, last_pos=None, table_poly=None,
         roi = _build_roi_mask(sh, sw, poly_local, scale, int(roi_margin))
         mot = None
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    mask = _ball_mask(hsv, white_v_min, white_s_max)
+    raw = _raw_ball_mask(hsv, white_v_min, white_s_max)
+    # Same empty-mask early-out as detect_ball_hsv (cleanup is a no-op there).
+    if not cv2.countNonZero(raw):
+        return None, gray
+    mask = _clean_ball_mask(raw)
     if roi is not None:
         mask = cv2.bitwise_and(mask, roi)
     best = _score_mask_contours(mask, scale, ox, oy, last_pos,

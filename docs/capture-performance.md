@@ -46,6 +46,37 @@ native video recorder. Supported flexible ranges can still deliver fewer than
   texture is flipped once through its coordinates. Each upload avoids the
   previous CPU image flip and `.tobytes()` copy. GL remains on Kivy's UI thread.
 
+## Detector CPU
+
+Exact-output reductions inside `app/serve_caller.py` (behaviour verified by
+the unit suite plus a frame-sequence equivalence replay against the previous
+revision; detection, tracking and bounce results are unchanged):
+
+- One orange hue range: `inRange` bounds are inclusive, so `[0,25]` is the
+  exact union of the old adjacent `[0,5]` and `[5,25]` passes. One fewer
+  `inRange` + `bitwise_or` per colour frame.
+- Empty colour mask early-out: when nothing in the ROI is ball-coloured,
+  median blur, morphological opening and contour scoring are skipped. Frames
+  with player/arm/shadow motion but no ball colour take the motion gate and
+  return before the cleanup stages.
+- Static-frame early-out with an active track: the per-contour motion
+  overlap test rejects every candidate when the dilated motion mask is all
+  zero, so the colour ROI decode/HSV/mask work is skipped on perfectly still
+  frames. A slow ball still produces some motion and takes the full path.
+- Contour scoring short-circuits: a bounding box with zero motion underneath
+  skips the fill/AND/count overlap test, and a contour whose circularity is
+  below both round and streak thresholds skips convex hull, enclosing
+  circle, min-area rect and polygon approximation. Both gates are
+  conjunctive, so rejections are identical.
+- Morphology kernels and the session's detector kwargs dict are built once
+  instead of per frame.
+
+Host A/B microbenchmark (Windows, OpenCV 5.0, one thread, 1280x720 NV21
+fixture, alternating baseline/current medians; not an Android measurement):
+active-track ball frames -12%, moving non-ball colour with track -51%,
+perfectly static frame with track -95%, static glare plus dark motion -24%.
+Static/no-track frames were already early-out and are unchanged.
+
 ## Validation
 
 Run `python -m unittest discover -s tests -v`. Checks include real worker

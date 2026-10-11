@@ -45,6 +45,12 @@ class DetectionSession:
                               else np.array(table.corners, copy=True))
         self.poly = self.table.quarter_poly("server_right")
         self.params = dict(params)
+        # Params are a snapshot (configure() builds a new session on any
+        # edit), so the detector kwargs dict can be built once up front.
+        self._detect_kwargs = {k: self.params[k] for k in (
+            "min_area", "max_area", "min_circ", "min_circ_streak",
+            "max_aspect", "min_solidity", "min_fill", "min_vertices",
+            "roi_margin", "motion_thresh", "white_v_min", "white_s_max")}
         self.tracker = BallTracker(max_jump=params["max_jump"],
                                    confirm_streak=int(params["confirm_streak"]))
         self.caller = ServeCaller(self.table, min_drop=params["min_drop"],
@@ -61,12 +67,9 @@ class DetectionSession:
             self.tracker.reset()
             self.previous = None
         self.last_time = timestamp
-        keys = ("min_area", "max_area", "min_circ", "min_circ_streak",
-                "max_aspect", "min_solidity", "min_fill", "min_vertices",
-                "roi_margin", "motion_thresh", "white_v_min", "white_s_max")
         det, current = detect_ball_nv21(
             nv21, w, h, self.tracker.pos, table_poly=self.poly,
-            prev_small=self.previous, **{k: self.params[k] for k in keys})
+            prev_small=self.previous, **self._detect_kwargs)
         if current is not None:
             self.previous = current
         pos = self.tracker.update(det[:2] if det else None)
